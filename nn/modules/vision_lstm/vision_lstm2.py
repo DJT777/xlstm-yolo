@@ -289,7 +289,7 @@ class MultiHeadLayerNorm(LayerNorm):
 from mlstm_kernels.torch.backend_module import mLSTMBackendConfig, mLSTMBackend
  
 
-# # # original
+# # # # original
 # class MatrixLSTMCell(nn.Module):
 #     def __init__(self, dim, num_heads, norm_bias=True):
 #         super().__init__()
@@ -351,21 +351,18 @@ from mlstm_kernels.torch.backend_module import mLSTMBackendConfig, mLSTMBackend
 #         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
 
 
-
-
-# Updated MatrixLSTMCell
 class MatrixLSTMCell(nn.Module):
     def __init__(self, dim, num_heads, norm_bias=True, chunk_size=256):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
 
-        # print("CHUNK SIZE: " + str(chunk_size))
+        # Gate projections
         self.igate = nn.Linear(3 * dim, num_heads)
         self.fgate = nn.Linear(3 * dim, num_heads)
         self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias)
 
-        # CPU-compatible backend configuration
+        # CPU-compatible backend configuration (remains float32)
         self.cpu_backend_config = mLSTMBackendConfig(
             chunkwise_kernel="chunkwise--native_autograd",
             sequence_kernel="native_sequence__native",
@@ -377,19 +374,17 @@ class MatrixLSTMCell(nn.Module):
         )
         self.cpu_backend = mLSTMBackend(self.cpu_backend_config)
 
-        # GPU-compatible (Triton) backend configuration
+        # GPU-compatible (Triton) backend configuration — use float16 for AMP
         self.gpu_backend_config = mLSTMBackendConfig(
             chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
             sequence_kernel="native_sequence__triton",
             step_kernel="triton",
             chunk_size=chunk_size,
-            autocast_kernel_dtype="float32",
+            autocast_kernel_dtype="bfloat16",  # changed from float32 to float16
             return_last_states=False,
             mode="train"
         )
-        self.gpu_backend = mLSTMBackend(self.gpu_backend_config) # Lazily initialize
-
-        self.causal_mask_cache = {}  # Retained for potential fallback
+        self.gpu_backend = mLSTMBackend(self.gpu_backend_config)
 
         # Internal states
         self.c_state = None
@@ -408,50 +403,39 @@ class MatrixLSTMCell(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         B, S, H = q.shape  # (B, S, H)
 
-        # Ensure all inputs are on the same device
+        # All inputs must reside on same device
         if not (q.device == k.device == v.device):
             raise ValueError("All input tensors (q, k, v) must be on the same device.")
-
         device = q.device
-        # print(device)
         backend = self.get_gpu_backend(device) if device.type == 'cuda' else self.cpu_backend
 
         # Prepare gate inputs
-        if_gate_input = torch.cat([q, k, v], dim=-1)  # (B, S, 3*H)
+        if_gate_input = torch.cat([q, k, v], dim=-1)
         i = self.igate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
         f = self.fgate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
 
-        # Reshape q, k, v for backend
-        q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, DH)
-        k = k.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, DH)
-        v = v.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, DH)
+        # Reshape for backend
+        q = q.view(B, S, self.num_heads, -1).transpose(1, 2)
+        k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
+        v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
 
-        # Call backend with current internal states
+        # Execute backend kernel
         h_state = backend(
             q=q, k=k, v=v, i=i, f=f,
-            # c_initial=self.c_state,
-            # n_initial=self.n_state,
-            # m_initial=self.m_state,
             return_last_states=False,
-            mode="train"  # or "inference" based on context
+            mode="train"
         )
 
-        # Update internal states
+        # Reset states
         self.c_state = None
         self.n_state = None
         self.m_state = None
-        # self.c_state = c_out
-        # self.n_state = n_out
-        # self.m_state = m_out
 
-        # Apply normalization and reshape
-        h_state_norm = self.outnorm(h_state)  # (B, NH, S, DH)
-        h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, H)  # (B, S, H)
-
-        return h_state_norm
+        # Normalize and reshape output
+        h_norm = self.outnorm(h_state)
+        return h_norm.transpose(1, 2).reshape(B, S, H)
 
     def reset_states(self):
-        """Reset internal states to None."""
         self.c_state = None
         self.n_state = None
         self.m_state = None
@@ -462,6 +446,117 @@ class MatrixLSTMCell(nn.Module):
         torch.nn.init.zeros_(self.igate.weight)
         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
         self.outnorm.reset_parameters()
+
+
+# Updated MatrixLSTMCell
+# class MatrixLSTMCell(nn.Module):
+#     def __init__(self, dim, num_heads, norm_bias=True, chunk_size=256):
+#         super().__init__()
+#         self.dim = dim
+#         self.num_heads = num_heads
+
+#         # print("CHUNK SIZE: " + str(chunk_size))
+#         self.igate = nn.Linear(3 * dim, num_heads)
+#         self.fgate = nn.Linear(3 * dim, num_heads)
+#         self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias)
+
+#         # CPU-compatible backend configuration
+#         self.cpu_backend_config = mLSTMBackendConfig(
+#             chunkwise_kernel="chunkwise--native_autograd",
+#             sequence_kernel="native_sequence__native",
+#             step_kernel="native",
+#             chunk_size=chunk_size,
+#             autocast_kernel_dtype="float32",
+#             return_last_states=False,
+#             mode="train"
+#         )
+#         self.cpu_backend = mLSTMBackend(self.cpu_backend_config)
+
+#         # GPU-compatible (Triton) backend configuration
+#         self.gpu_backend_config = mLSTMBackendConfig(
+#             chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
+#             sequence_kernel="native_sequence__triton",
+#             step_kernel="triton",
+#             chunk_size=chunk_size,
+#             autocast_kernel_dtype="float32",
+#             return_last_states=False,
+#             mode="train"
+#         )
+#         self.gpu_backend = mLSTMBackend(self.gpu_backend_config) # Lazily initialize
+
+#         self.causal_mask_cache = {}  # Retained for potential fallback
+
+#         # Internal states
+#         self.c_state = None
+#         self.n_state = None
+#         self.m_state = None
+
+#         self.reset_parameters()
+
+#     def get_gpu_backend(self, device):
+#         if self.gpu_backend is None:
+#             if not torch.cuda.is_available():
+#                 raise RuntimeError("CUDA is not available, but a CUDA device was requested.")
+#             self.gpu_backend = mLSTMBackend(self.gpu_backend_config).to(device)
+#         return self.gpu_backend
+
+#     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+#         B, S, H = q.shape  # (B, S, H)
+
+#         # Ensure all inputs are on the same device
+#         if not (q.device == k.device == v.device):
+#             raise ValueError("All input tensors (q, k, v) must be on the same device.")
+
+#         device = q.device
+#         # print(device)
+#         backend = self.get_gpu_backend(device) if device.type == 'cuda' else self.cpu_backend
+
+#         # Prepare gate inputs
+#         if_gate_input = torch.cat([q, k, v], dim=-1)  # (B, S, 3*H)
+#         i = self.igate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
+#         f = self.fgate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
+
+#         # Reshape q, k, v for backend
+#         q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, DH)
+#         k = k.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, DH)
+#         v = v.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, DH)
+
+#         # Call backend with current internal states
+#         h_state = backend(
+#             q=q, k=k, v=v, i=i, f=f,
+#             # c_initial=self.c_state,
+#             # n_initial=self.n_state,
+#             # m_initial=self.m_state,
+#             return_last_states=False,
+#             mode="train"  # or "inference" based on context
+#         )
+
+#         # Update internal states
+#         self.c_state = None
+#         self.n_state = None
+#         self.m_state = None
+#         # self.c_state = c_out
+#         # self.n_state = n_out
+#         # self.m_state = m_out
+
+#         # Apply normalization and reshape
+#         h_state_norm = self.outnorm(h_state)  # (B, NH, S, DH)
+#         h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, H)  # (B, S, H)
+
+#         return h_state_norm
+
+#     def reset_states(self):
+#         """Reset internal states to None."""
+#         self.c_state = None
+#         self.n_state = None
+#         self.m_state = None
+
+#     def reset_parameters(self):
+#         torch.nn.init.zeros_(self.fgate.weight)
+#         bias_linspace_init_(self.fgate.bias, start=3.0, end=6.0)
+#         torch.nn.init.zeros_(self.igate.weight)
+#         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
+#         self.outnorm.reset_parameters()
 
 
 class ViLLayer(nn.Module):
@@ -1946,7 +2041,8 @@ class ViLLayerLite(nn.Module):
         self.mlstm_cell      = MatrixLSTMCell(dim=inner_dim,
                                               num_heads=self.mlstm_num_heads,
                                               norm_bias=norm_bias,
-                                              chunk_size=chunk_size)
+                                            #   chunk_size=chunk_size
+                                            )
         self.learnable_skip  = nn.Parameter(torch.ones(inner_dim))
 
         # down-projection
