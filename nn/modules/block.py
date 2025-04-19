@@ -1743,6 +1743,8 @@ class ViLBlockPairBlock(nn.Module):
         else:
             raise ValueError("seqlens must be a list/tuple of length 2 (2D) or 3 (3D)")
 
+        # print(seqlens)
+        # print(config.get("chunk_size", 256))
         # Initialize the underlying ViLBlockPair without hidden state management
         self.module = ViLBlockPair(
             dim=c2,
@@ -2267,9 +2269,9 @@ class ViLFusionBlock(nn.Module):
         if self.mlp_branch:
             # Flatten again for MLP (RGBlock expects 4D input)
             seq = einops.rearrange(x, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
-            seq_norm = self.norm2(seq)  # (B, S, hidden_dim)
+            # seq_norm = self.norm2(seq)  # (B, S, hidden_dim)
             # Reshape to 4D for RGBlock
-            x_mlp = einops.rearrange(seq_norm, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
+            x_mlp = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
             x_mlp = self.mlp(x_mlp)  # (B, hidden_dim, H, W)
             # Add back with drop path
             x = x + self.drop_path(x_mlp)  # (B, hidden_dim, H, W)

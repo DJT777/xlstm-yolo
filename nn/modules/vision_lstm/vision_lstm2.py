@@ -351,6 +351,105 @@ from mlstm_kernels.torch.backend_module import mLSTMBackendConfig, mLSTMBackend
 #         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
 
 
+# class MatrixLSTMCell(nn.Module):
+#     def __init__(self, dim, num_heads, norm_bias=True, chunk_size=64):
+#         super().__init__()
+#         self.dim = dim
+#         self.num_heads = num_heads
+
+#         # Gate projections
+#         self.igate = nn.Linear(3 * dim, num_heads)
+#         self.fgate = nn.Linear(3 * dim, num_heads)
+#         self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias)
+
+#         # CPU-compatible backend configuration (remains float32)
+#         self.cpu_backend_config = mLSTMBackendConfig(
+#             chunkwise_kernel="chunkwise--native_autograd",
+#             sequence_kernel="native_sequence__native",
+#             step_kernel="native",
+#             chunk_size=chunk_size,
+#             autocast_kernel_dtype="float32",
+#             return_last_states=False,
+#             mode="train"
+#         )
+#         self.cpu_backend = mLSTMBackend(self.cpu_backend_config)
+
+#         # GPU-compatible (Triton) backend configuration — use float16 for AMP
+#         self.gpu_backend_config = mLSTMBackendConfig(
+#             chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
+#             sequence_kernel="native_sequence__triton",
+#             step_kernel="triton",
+#             chunk_size=chunk_size,
+#             autocast_kernel_dtype="float32",  # changed from float32 to float16
+#             return_last_states=False,
+#             mode="train"
+#         )
+#         self.gpu_backend = mLSTMBackend(self.gpu_backend_config)
+
+#         # Internal states
+#         self.c_state = None
+#         self.n_state = None
+#         self.m_state = None
+
+#         self.reset_parameters()
+
+#     def get_gpu_backend(self, device):
+#         if self.gpu_backend is None:
+#             if not torch.cuda.is_available():
+#                 raise RuntimeError("CUDA is not available, but a CUDA device was requested.")
+#             self.gpu_backend = mLSTMBackend(self.gpu_backend_config).to(device)
+#         return self.gpu_backend
+
+#     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+#         B, S, H = q.shape  # (B, S, H)
+
+#         # All inputs must reside on same device
+#         if not (q.device == k.device == v.device):
+#             raise ValueError("All input tensors (q, k, v) must be on the same device.")
+#         device = q.device
+#         backend = self.get_gpu_backend(device) if device.type == 'cuda' else self.cpu_backend
+#         backend = self.gpu_backend
+
+#         # Prepare gate inputs
+#         if_gate_input = torch.cat([q, k, v], dim=-1)
+#         i = self.igate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
+#         f = self.fgate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
+
+#         # Reshape for backend
+#         q = q.view(B, S, self.num_heads, -1).transpose(1, 2)
+#         k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
+#         v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
+
+#         # Execute backend kernel
+#         h_state = backend(
+#             q=q, k=k, v=v, i=i, f=f,
+#             return_last_states=False,
+#             mode="train"
+#         )
+
+#         # Reset states
+#         self.c_state = None
+#         self.n_state = None
+#         self.m_state = None
+
+#         # Normalize and reshape output
+#         h_norm = self.outnorm(h_state)
+#         return h_norm.transpose(1, 2).reshape(B, S, H)
+
+#     def reset_states(self):
+#         self.c_state = None
+#         self.n_state = None
+#         self.m_state = None
+
+#     def reset_parameters(self):
+#         torch.nn.init.zeros_(self.fgate.weight)
+#         bias_linspace_init_(self.fgate.bias, start=3.0, end=6.0)
+#         torch.nn.init.zeros_(self.igate.weight)
+#         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
+#         self.outnorm.reset_parameters()
+
+
+#mixed precision MLSTM
 class MatrixLSTMCell(nn.Module):
     def __init__(self, dim, num_heads, norm_bias=True, chunk_size=256):
         super().__init__()
@@ -362,52 +461,55 @@ class MatrixLSTMCell(nn.Module):
         self.fgate = nn.Linear(3 * dim, num_heads)
         self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias)
 
-        # CPU-compatible backend configuration (remains float32)
+        # CPU backend config (float32 precision)
         self.cpu_backend_config = mLSTMBackendConfig(
             chunkwise_kernel="chunkwise--native_autograd",
             sequence_kernel="native_sequence__native",
             step_kernel="native",
-            chunk_size=chunk_size,
+            chunk_size=64,
             autocast_kernel_dtype="float32",
             return_last_states=False,
             mode="train"
         )
         self.cpu_backend = mLSTMBackend(self.cpu_backend_config)
 
-        # GPU-compatible (Triton) backend configuration — use float16 for AMP
+        # GPU backend config (dtype will be set at runtime)
         self.gpu_backend_config = mLSTMBackendConfig(
             chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
             sequence_kernel="native_sequence__triton",
             step_kernel="triton",
-            chunk_size=chunk_size,
-            autocast_kernel_dtype="bfloat16",  # changed from float32 to float16
+            chunk_size=64,
+            autocast_kernel_dtype="float32",  # placeholder
             return_last_states=False,
             mode="train"
         )
-        self.gpu_backend = mLSTMBackend(self.gpu_backend_config)
-
-        # Internal states
-        self.c_state = None
-        self.n_state = None
-        self.m_state = None
-
+        self.gpu_backend = None
         self.reset_parameters()
 
     def get_gpu_backend(self, device):
-        if self.gpu_backend is None:
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA is not available, but a CUDA device was requested.")
-            self.gpu_backend = mLSTMBackend(self.gpu_backend_config).to(device)
+        # (Re)instantiate backend to pick up updated dtype
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA is not available, but a CUDA device was requested.")
+        self.gpu_backend = mLSTMBackend(self.gpu_backend_config).to(device)
         return self.gpu_backend
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         B, S, H = q.shape  # (B, S, H)
 
-        # All inputs must reside on same device
-        if not (q.device == k.device == v.device):
-            raise ValueError("All input tensors (q, k, v) must be on the same device.")
+        # All inputs must be on the same device
         device = q.device
-        backend = self.get_gpu_backend(device) if device.type == 'cuda' else self.cpu_backend
+        if not (q.device == k.device == v.device):
+            raise ValueError("All inputs must be on the same device.")
+
+        # 1) Determine kernel dtype from actual tensor dtype
+        kernel_dtype = "float16" if q.dtype == torch.float16 else "float32"
+        self.gpu_backend_config.autocast_kernel_dtype = kernel_dtype
+
+        # 2) Select proper backend
+        if device.type == 'cuda':
+            backend = self.get_gpu_backend(device)
+        else:
+            backend = self.cpu_backend
 
         # Prepare gate inputs
         if_gate_input = torch.cat([q, k, v], dim=-1)
@@ -419,7 +521,7 @@ class MatrixLSTMCell(nn.Module):
         k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
         v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
 
-        # Execute backend kernel
+        # Execute backend kernel (dtype-aligned)
         h_state = backend(
             q=q, k=k, v=v, i=i, f=f,
             return_last_states=False,
@@ -446,6 +548,7 @@ class MatrixLSTMCell(nn.Module):
         torch.nn.init.zeros_(self.igate.weight)
         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
         self.outnorm.reset_parameters()
+
 
 
 # Updated MatrixLSTMCell
@@ -574,7 +677,7 @@ class ViLLayer(nn.Module):
         init_weights="original",
         seqlens=None,  # Initial seqlens, can be overridden in forward
         num_blocks=None,
-        chunk_size=256,
+        chunk_size=64,
     ):
         super().__init__()
         assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
@@ -624,11 +727,12 @@ class ViLLayer(nn.Module):
         else:
             raise NotImplementedError(f"conv_kind={conv_kind} not implemented.")
 
+
         self.mlstm_cell = MatrixLSTMCell(
             dim=inner_dim,
             num_heads=qkv_block_size,
             norm_bias=norm_bias,
-            # chunk_size=chunk_size,
+            chunk_size=chunk_size,
         )
         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
         self.proj_down = nn.Linear(in_features=inner_dim, out_features=dim, bias=proj_bias)
@@ -729,7 +833,19 @@ class ViLBlock(nn.Module):
 
         self.drop_path = DropPath(drop_prob=drop_path)
         self.norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias)
-        # self.layer = ViLLayer(
+        self.layer = ViLLayer(
+            dim=dim,
+            direction=direction,
+            conv_kind=conv_kind,
+            conv_kernel_size=conv_kernel_size,
+            seqlens=seqlens,
+            norm_bias=norm_bias,
+            proj_bias=proj_bias,
+            num_blocks=num_blocks,
+            init_weights=init_weights,
+            chunk_size=chunk_size,)
+        # )
+        # self.layer = ViLLayerLite(
         #     dim=dim,
         #     direction=direction,
         #     conv_kind=conv_kind,
@@ -740,21 +856,9 @@ class ViLBlock(nn.Module):
         #     num_blocks=num_blocks,
         #     init_weights=init_weights,
         #     chunk_size=chunk_size,
+        #     qkv_block_size = 4,
+        #     mlp_type="baseline"
         # )
-        self.layer = ViLLayerLite(
-            dim=dim,
-            direction=direction,
-            conv_kind=conv_kind,
-            conv_kernel_size=conv_kernel_size,
-            seqlens=seqlens,
-            norm_bias=norm_bias,
-            proj_bias=proj_bias,
-            num_blocks=num_blocks,
-            init_weights=init_weights,
-            chunk_size=chunk_size,
-            qkv_block_size = 4,
-            mlp_type="baseline"
-        )
 
         self.reset_parameters()
 
@@ -1962,7 +2066,7 @@ class ViLLayerLite(nn.Module):
         proj_factor: int = 2,          # how many inner_dims to project up to
         num_proj_splits: int = 2,      # must equal proj_factor
         mlp_factor: int = 4,           # hidden size multiplier for post-MLP (mlp_factor * dim)
-        qkv_block_size: int = 2,       # for block-diagonal Q/K/V
+        qkv_block_size: int = 4,       # for block-diagonal Q/K/V
         mlstm_num_heads: int | None = None,
         proj_bias: bool = True,
         norm_bias: bool = True,
@@ -2041,7 +2145,7 @@ class ViLLayerLite(nn.Module):
         self.mlstm_cell      = MatrixLSTMCell(dim=inner_dim,
                                               num_heads=self.mlstm_num_heads,
                                               norm_bias=norm_bias,
-                                            #   chunk_size=chunk_size
+                                              #chunk_size=chunk_size
                                             )
         self.learnable_skip  = nn.Parameter(torch.ones(inner_dim))
 

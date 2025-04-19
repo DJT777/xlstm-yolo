@@ -104,7 +104,7 @@ def autocast(enabled: bool, device: str = "cuda"):
     if TORCH_1_13:
         return torch.amp.autocast(device, enabled=enabled)
     else:
-        return torch.cuda.amp.autocast(enabled,)
+        return torch.cuda.amp.autocast(enabled)
 
 
 def get_cpu_info():
