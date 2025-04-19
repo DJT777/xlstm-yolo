@@ -479,7 +479,7 @@ class MatrixLSTMCell(nn.Module):
             sequence_kernel="native_sequence__triton",
             step_kernel="triton",
             chunk_size=64,
-            autocast_kernel_dtype="float32",  # placeholder
+            autocast_kernel_dtype="bfloat16",  # placeholder
             return_last_states=False,
             mode="train"
         )
@@ -662,6 +662,153 @@ class MatrixLSTMCell(nn.Module):
 #         self.outnorm.reset_parameters()
 
 
+# class ViLLayer(nn.Module):
+#     def __init__(
+#         self,
+#         dim,
+#         direction,
+#         expansion=2,
+#         qkv_block_size=4,
+#         proj_bias=True,
+#         norm_bias=True,
+#         conv_bias=True,
+#         conv_kernel_size=4,
+#         conv_kind="2d",
+#         init_weights="original",
+#         seqlens=None,  # Initial seqlens, can be overridden in forward
+#         num_blocks=None,
+#         chunk_size=64,
+#     ):
+#         super().__init__()
+#         assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+#         self.dim = dim
+#         self.direction = direction
+#         self.expansion = expansion
+#         self.qkv_block_size = qkv_block_size
+#         self.proj_bias = proj_bias
+#         self.conv_bias = conv_bias
+#         self.conv_kernel_size = conv_kernel_size
+#         self.conv_kind = conv_kind
+#         self.init_weights = init_weights
+#         self.num_blocks = num_blocks
+
+#         inner_dim = expansion * dim
+#         num_heads = inner_dim // qkv_block_size
+#         self.proj_up = nn.Linear(in_features=dim, out_features=2 * inner_dim, bias=proj_bias)
+#         self.q_proj = LinearHeadwiseExpand(dim=inner_dim, num_heads=num_heads, bias=proj_bias)
+#         self.k_proj = LinearHeadwiseExpand(dim=inner_dim, num_heads=num_heads, bias=proj_bias)
+#         self.v_proj = LinearHeadwiseExpand(dim=inner_dim, num_heads=num_heads, bias=proj_bias)
+
+#         # Convolution selection with 3D support
+#         if conv_kind == "causal1d":
+#             self.conv = CausalConv1d(dim=inner_dim, kernel_size=conv_kernel_size, bias=conv_bias)
+#         elif conv_kind == "2d":
+#             assert conv_kernel_size % 2 == 1, "For 2D, kernel size must be odd for same spatial dims"
+#             self.conv = SequenceConv2d(
+#                 in_channels=inner_dim,
+#                 out_channels=inner_dim,
+#                 kernel_size=conv_kernel_size,
+#                 padding=conv_kernel_size // 2,
+#                 groups=inner_dim,
+#                 bias=conv_bias,
+#                 seqlens=seqlens if seqlens and len(seqlens) == 2 else None,
+#             )
+#         elif conv_kind == "3d":
+#             assert conv_kernel_size % 2 == 1, "For 3D, kernel size must be odd for same spatial dims"
+#             self.conv = SequenceConv3d(
+#                 in_channels=inner_dim,
+#                 out_channels=inner_dim,
+#                 kernel_size=conv_kernel_size,
+#                 padding=conv_kernel_size // 2,
+#                 groups=inner_dim,
+#                 bias=conv_bias,
+#                 seqlens=seqlens if seqlens and len(seqlens) == 3 else None,
+#             )
+#         else:
+#             raise NotImplementedError(f"conv_kind={conv_kind} not implemented.")
+
+
+#         self.mlstm_cell = MatrixLSTMCell(
+#             dim=inner_dim,
+#             num_heads=qkv_block_size,
+#             norm_bias=norm_bias,
+#             chunk_size=chunk_size,
+#         )
+#         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
+#         self.proj_down = nn.Linear(in_features=inner_dim, out_features=dim, bias=proj_bias)
+
+#         self.reset_parameters()
+
+#     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:
+#         B, S, _ = x.shape  # S = T * H * W for 3D sequences
+
+#         # Update conv seqlens dynamically if provided
+#         if seqlens and hasattr(self.conv, 'seqlens'):
+#             if self.conv_kind == "2d" and len(seqlens) == 2:
+#                 self.conv.seqlens = seqlens
+#             elif self.conv_kind == "3d" and len(seqlens) == 3:
+#                 self.conv.seqlens = seqlens
+#             elif self.conv_kind != "causal1d":
+#                 raise ValueError(f"seqlens {seqlens} incompatible with conv_kind={self.conv_kind}")
+
+#         # Direction handling
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_TOP_LEFT:
+#             pass
+#         elif self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             x = x.flip(dims=[1])
+#         else:
+#             raise NotImplementedError(f"Unknown direction: {self.direction}")
+
+#         x_inner = self.proj_up(x)
+#         x_mlstm, z = torch.chunk(x_inner, chunks=2, dim=-1)
+#         x_mlstm_conv = self.conv(x_mlstm)  # Convolution handles 2D or 3D internally
+#         x_mlstm_conv_act = F.silu(x_mlstm_conv)
+
+#         q = self.q_proj(x_mlstm_conv_act)
+#         k = self.k_proj(x_mlstm_conv_act)
+#         v = self.v_proj(x_mlstm)
+
+#         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+
+#         h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_mlstm_conv_act)
+#         h_state = h_tilde_state_skip * F.silu(z)
+#         out = self.proj_down(h_state)
+
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             out = out.flip(dims=[1])
+
+# #         return out
+
+#     def reset_parameters(self):
+#         small_init_(self.proj_up.weight, dim=self.dim)
+#         if self.proj_up.bias is not None:
+#             nn.init.zeros_(self.proj_up.bias)
+
+#         if self.init_weights == "original":
+#             wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=1)
+#         elif self.init_weights == "original-fixed":
+#             wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=self.num_blocks)
+#         else:
+#             raise NotImplementedError(f"Unknown init_weights: {self.init_weights}")
+#         if self.proj_down.bias is not None:
+#             nn.init.zeros_(self.proj_down.bias)
+
+#         nn.init.ones_(self.learnable_skip)
+
+#         def _init_qkv_proj(qkv_proj: LinearHeadwiseExpand):
+#             small_init_(qkv_proj.weight, dim=self.dim)
+#             if qkv_proj.bias is not None:
+#                 nn.init.zeros_(qkv_proj.bias)
+
+#         _init_qkv_proj(self.q_proj)
+#         _init_qkv_proj(self.k_proj)
+#         _init_qkv_proj(self.v_proj)
+
+#         self.mlstm_cell.reset_parameters()
+
+from .mlstm_large import mLSTMLayerVision
+
+
 class ViLLayer(nn.Module):
     def __init__(
         self,
@@ -674,9 +821,9 @@ class ViLLayer(nn.Module):
         conv_bias=True,
         conv_kernel_size=4,
         conv_kind="2d",
-        init_weights="original",
+        init_weights="original-fixed",
         seqlens=None,  # Initial seqlens, can be overridden in forward
-        num_blocks=None,
+        num_blocks=12,
         chunk_size=64,
     ):
         super().__init__()
@@ -805,8 +952,10 @@ class ViLLayer(nn.Module):
         _init_qkv_proj(self.v_proj)
 
         self.mlstm_cell.reset_parameters()
-
     
+
+from .mlstm_large import VilLayerUpdated
+
 class ViLBlock(nn.Module):
     def __init__(
         self,
@@ -833,18 +982,42 @@ class ViLBlock(nn.Module):
 
         self.drop_path = DropPath(drop_prob=drop_path)
         self.norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias)
-        self.layer = ViLLayer(
-            dim=dim,
-            direction=direction,
-            conv_kind=conv_kind,
-            conv_kernel_size=conv_kernel_size,
+        self.layer = VilLayerUpdated(
+            embedding_dim=dim,
+            num_heads=4,
+            use_bias=True,
+            norm_eps = 1e-6,
+            norm_reduction_force_float32=True,
+            qk_dim_factor=0.5,
+            v_dim_factor=1.0,
+            gate_soft_cap=15.0,
+            weight_mode="single",
+            ffn_proj_factor=2.6667,
+            ffn_round_up_to_multiple_of=64,
+            chunkwise_kernel = "chunkwise--triton_limit_chunk",
+            sequence_kernel = "native_sequence__triton",
+            step_kernel = "triton",
+            mode = "train",
+            chunk_size=chunk_size,            
+            return_last_states=False,
+            autocast_kernel_dtype="float32",
+            eps = 1e-6,
+            inference_state_dtype="float32",
             seqlens=seqlens,
-            norm_bias=norm_bias,
-            proj_bias=proj_bias,
-            num_blocks=num_blocks,
-            init_weights=init_weights,
-            chunk_size=chunk_size,)
-        # )
+            direction=direction
+        )
+        # self.layer = ViLLayer(
+        #     dim=dim,
+        #     direction=direction,
+        #     conv_kind=conv_kind,
+        #     conv_kernel_size=conv_kernel_size,
+        #     seqlens=seqlens,
+        #     norm_bias=norm_bias,
+        #     proj_bias=proj_bias,
+        #     num_blocks=num_blocks,
+        #     init_weights=init_weights,
+        #     chunk_size=chunk_size,)
+        # # )
         # self.layer = ViLLayerLite(
         #     dim=dim,
         #     direction=direction,
@@ -864,7 +1037,7 @@ class ViLBlock(nn.Module):
 
     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:
         x = self.norm(x)
-        residual = self.layer(x, seqlens=seqlens)
+        residual = self.layer(x)
         out = self.drop_path(x, lambda _: residual)
         return out
 
@@ -2215,9 +2388,21 @@ class ViLLayerLite(nn.Module):
         nn.init.ones_(self.learnable_skip)
 
 
-# Helper initialization functions (assumed to be defined elsewhere)
-def small_init_(weight, dim):
-    nn.init.normal_(weight, mean=0.0, std=0.02 / (dim ** 0.5))
 
-def wang_init_(weight, dim, num_blocks):
-    nn.init.normal_(weight, mean=0.0, std=(2 / (dim * num_blocks)) ** 0.5)
+def small_init_init_(param: torch.Tensor, dim: int) -> torch.Tensor:
+    """
+    Fills the input Tensor with values according to the method described in Transformers without Tears: Improving
+    the Normalization of Self-Attention - Nguyen, T. & Salazar, J. (2019), using a normal distribution.
+    Adopted from https://github.com/EleutherAI/gpt-neox/blob/main/megatron/model/init_functions.py.
+    """
+    std = math.sqrt(2 / (5 * dim))
+    torch.nn.init.normal_(param, mean=0.0, std=std)
+    return param
+
+
+def wang_init_(param: torch.Tensor, dim: int, num_blocks: int):
+    """ Adopted from https://github.com/EleutherAI/gpt-neox/blob/main/megatron/model/init_functions.py. """
+    std = 2 / num_blocks / math.sqrt(dim)
+    torch.nn.init.normal_(param, mean=0.0, std=std)
+    return param
+
