@@ -70,7 +70,8 @@ from .block import (
     VisionClueMerge,
     XViLBlockPairBlock,
     ViLFusionBlock,
-    ViLLayerNormBlock
+    ViLLayerNormBlock,
+    PatchMerger
 )
 from .conv import (
     CBAM,

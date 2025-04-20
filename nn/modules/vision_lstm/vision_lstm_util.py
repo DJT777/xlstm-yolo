@@ -196,6 +196,14 @@ class VitPatchEmbed(nn.Module):
         x = self.proj(x)
         x = einops.rearrange(x, "b c ... -> b ... c")
         return x
+    
+    @torch.jit.ignore
+    def no_weight_decay(self):
+        """
+        Tell downstream optimizers to skip weight‑decay on positional embeddings.
+        TorchScript will drop this method at JIT time.
+        """
+        return {"embed"}
 
 
 # General VitPosEmbed supporting arbitrary dimensions (from vit_pos_embed.py)
@@ -204,7 +212,7 @@ class VitPosEmbed(nn.Module):
             self,
             seqlens,
             dim: int,
-            is_learnable: bool = False,
+            is_learnable: bool = True,
             allow_interpolation: bool = True,
             interpolate_offset: float = None,
     ):

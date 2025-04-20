@@ -18,6 +18,12 @@ class SequenceTraversal(Enum):
     ROWWISE_FROM_BOT_RIGHT = "rowwise_from_bot_right"
 
 
+def round_up_to_next_multiple_of(x: int, multiple_of: int) -> int:
+    """Rounds up x to the next multiple of multiple_of."""
+    return int(((x + multiple_of - 1) // multiple_of) * multiple_of)
+
+
+
 def bias_linspace_init_(param: torch.Tensor, start: float = 3.4, end: float = 6.0) -> torch.Tensor:
     """Linearly spaced bias init across dimensions."""
     assert param.dim() == 1, f"param must be 1-dimensional (typically a bias), got {param.dim()}"
@@ -44,6 +50,88 @@ def wang_init_(param: torch.Tensor, dim: int, num_blocks: int):
     std = 2 / num_blocks / math.sqrt(dim)
     torch.nn.init.normal_(param, mean=0.0, std=std)
     return param
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        embedding_dim,
+        ffn_proj_factor=2.6667,
+        ffn_round_up_to_multiple_of=64,
+        use_bias=True,
+        weight_mode="fused",
+        num_blocks=1,
+    ):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.ffn_proj_factor = ffn_proj_factor
+        self.ffn_round_up_to_multiple_of = ffn_round_up_to_multiple_of
+        self.use_bias = use_bias
+        self.weight_mode = weight_mode
+        self.num_blocks = num_blocks
+
+        self.up_proj_dim = round_up_to_next_multiple_of(
+            embedding_dim * ffn_proj_factor,
+            ffn_round_up_to_multiple_of,
+        )
+
+        if self.weight_mode == "single":
+            self.proj_up_gate = nn.Linear(
+                in_features=embedding_dim,
+                out_features=self.up_proj_dim,
+                bias=use_bias,
+            )
+            self.proj_up = nn.Linear(
+                in_features=embedding_dim,
+                out_features=self.up_proj_dim,
+                bias=use_bias,
+            )
+        elif self.weight_mode == "fused":
+            self.proj_up_gate_z = nn.Linear(
+                in_features=embedding_dim,
+                out_features=2 * self.up_proj_dim,
+                bias=use_bias,
+            )
+
+        self.proj_down = nn.Linear(
+            in_features=self.up_proj_dim,
+            out_features=embedding_dim,
+            bias=use_bias,
+        )
+
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight_mode == "single":
+            x = self.act_fn(self.proj_up_gate(x)) * self.proj_up(x)
+        elif self.weight_mode == "fused":
+            x = self.proj_up_gate_z(x)
+            gate, z = torch.tensor_split(x, (self.up_proj_dim,), dim=-1)
+            x = self.act_fn(gate) * z
+
+        y = self.proj_down(x)
+        return y
+
+    def reset_parameters(self):
+        if self.weight_mode == "fused":
+            small_init_(self.proj_up_gate_z.weight, dim=self.embedding_dim)
+            if self.proj_up_gate_z.bias is not None:
+                nn.init.zeros_(self.proj_up_gate_z.bias)
+        elif self.weight_mode == "single":
+            small_init_(self.proj_up_gate.weight, dim=self.embedding_dim)
+            small_init_(self.proj_up.weight, dim=self.embedding_dim)
+            if self.proj_up_gate.bias is not None:
+                nn.init.zeros_(self.proj_up_gate.bias)
+            if self.proj_up.bias is not None:
+                nn.init.zeros_(self.proj_up.bias)
+
+        wang_init_(
+            self.proj_down.weight,
+            dim=self.embedding_dim,
+            num_blocks=self.num_blocks or 1,
+        )
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
 
 
 def parallel_stabilized_simple(
@@ -288,8 +376,26 @@ class MultiHeadLayerNorm(LayerNorm):
         return out
 
 
+class MultiHeadRMSNorm(nn.Module):
+    def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6, affine: bool = True):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.eps = eps
+        self.rmsnorm = nn.RMSNorm(num_heads * head_dim, eps=eps, elementwise_affine=affine)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, NH, S, DH) -> (B, S, NH, DH)
+        x = x.transpose(1, 2)  # (B, S, NH, DH)
+        B, S, NH, DH = x.shape
+        x = x.reshape(B, S, -1)  # (B, S, NH * DH)
+        x = self.rmsnorm(x)  # (B, S, NH * DH)
+        x = x.view(B, S, NH, DH).transpose(1, 2)  # (B, NH, S, DH)
+        return x
+
+#GPT 4.5 refactor
 class MatrixLSTMCell(nn.Module):
-    def __init__(self, dim, num_heads):
+    def __init__(self, dim, num_heads, norm_bias=True):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
@@ -351,6 +457,278 @@ class MatrixLSTMCell(nn.Module):
         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
 
 
+# #original
+# class MatrixLSTMCell(nn.Module):
+#     def __init__(self, dim, num_heads):
+#         super().__init__()
+#         self.dim = dim
+#         self.num_heads = num_heads
+
+#         self.igate = nn.Linear(3 * dim, num_heads)
+#         self.fgate = nn.Linear(3 * dim, num_heads)
+#         self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=False)
+#         self.causal_mask_cache = {}
+#         self.reset_parameters()
+
+#     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+#         B, S, _ = q.shape  # (B, S, H)
+
+#         if_gate_input = torch.cat([q, k, v], dim=-1)
+#         q = q.view(B, S, self.num_heads, -1)  # (B, S, NH, DH)
+#         k = k.view(B, S, self.num_heads, -1)  # (B, S, NH, DH)
+#         v = v.view(B, S, self.num_heads, -1)  # (B, S, NH, DH)
+
+#         q = q.transpose(1, 2)  # (B, NH, S, DH)
+#         k = k.transpose(1, 2)  # (B, NH, S, DH)
+#         v = v.transpose(1, 2)  # (B, NH, S, DH)
+
+#         # compute input and forget gate pre-activations
+#         igate_preact = self.igate(if_gate_input)  # (B, S, NH)
+#         igate_preact = igate_preact.transpose(-1, -2).unsqueeze(-1)  # (B, NH, S, 1)
+#         fgate_preact = self.fgate(if_gate_input)  # (B, S, NH)
+#         fgate_preact = fgate_preact.transpose(-1, -2).unsqueeze(-1)  # (B, NH, S, 1)#
+
+#         # cache causal mask to avoid memory allocation in every iteration
+#         if S in self.causal_mask_cache:
+#             causal_mask = self.causal_mask_cache[(S, str(q.device))]
+#         else:
+#             causal_mask = torch.tril(torch.ones(S, S, dtype=torch.bool, device=q.device))
+#             self.causal_mask_cache[(S, str(q.device))] = causal_mask
+
+#         h_state = parallel_stabilized_simple(
+#             queries=q,
+#             keys=k,
+#             values=v,
+#             igate_preact=igate_preact,
+#             fgate_preact=fgate_preact,
+#             lower_triangular_matrix=causal_mask,
+#         )  # (B, NH, S, DH)
+
+#         print(torch.isnan(h_state).any())
+
+#         h_state_norm = self.outnorm(h_state)  # (B, NH, S, DH)
+#         h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, -1)  # (B, NH, S, DH) -> (B, S, NH, DH) -> (B, S, H)
+
+#         return h_state_norm
+
+#     def reset_parameters(self):
+#         self.outnorm.reset_parameters()
+#         # forget gate initialization
+#         torch.nn.init.zeros_(self.fgate.weight)
+#         bias_linspace_init_(self.fgate.bias, start=3.0, end=6.0)
+#         # input gate initialization
+#         torch.nn.init.zeros_(self.igate.weight)
+#         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
+
+
+# class ViLLayer(nn.Module):
+#     def __init__(
+#             self,
+#             dim,
+#             direction,
+#             expansion=2,
+#             qkv_block_size=4,
+#             proj_bias=False,
+#             conv_bias=True,
+#             kernel_size=4,
+#     ):
+#         super().__init__()
+#         assert dim % qkv_block_size == 0
+#         self.dim = dim
+#         self.direction = direction
+#         self.expansion = expansion
+#         self.qkv_block_size = qkv_block_size
+#         self.proj_bias = proj_bias
+#         self.conv_bias = conv_bias
+#         self.kernel_size = kernel_size
+
+#         inner_dim = expansion * dim
+#         num_heads = inner_dim // qkv_block_size
+#         self.proj_up = nn.Linear(
+#             in_features=dim,
+#             out_features=2 * inner_dim,
+#             bias=proj_bias,
+#         )
+#         self.q_proj = LinearHeadwiseExpand(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             bias=proj_bias,
+#         )
+#         self.k_proj = LinearHeadwiseExpand(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             bias=proj_bias,
+#         )
+#         self.v_proj = LinearHeadwiseExpand(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             bias=proj_bias,
+#         )
+
+#         self.conv1d = CausalConv1d(
+#             dim=inner_dim,
+#             kernel_size=kernel_size,
+#             bias=conv_bias,
+#         )
+#         self.mlstm_cell = MatrixLSTMCell(
+#             dim=inner_dim,
+#             num_heads=qkv_block_size,
+#         )
+#         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
+
+#         self.proj_down = nn.Linear(
+#             in_features=inner_dim,
+#             out_features=dim,
+#             bias=proj_bias,
+#         )
+#         self.reset_parameters()
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         B, S, _ = x.shape
+
+#         # alternate direction in successive layers
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_TOP_LEFT:
+#             pass
+#         elif self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             x = x.flip(dims=[1])
+#         else:
+#             raise NotImplementedError
+
+#         # up-projection
+#         x_inner = self.proj_up(x)
+#         x_mlstm, z = torch.chunk(x_inner, chunks=2, dim=-1)
+
+#         # mlstm branch
+#         x_mlstm_conv = self.conv1d(x_mlstm)
+#         x_mlstm_conv_act = F.silu(x_mlstm_conv)
+#         q = self.q_proj(x_mlstm_conv_act)
+#         k = self.k_proj(x_mlstm_conv_act)
+#         v = self.v_proj(x_mlstm)
+#         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+#         h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_mlstm_conv_act)
+
+#         # output / z branch
+#         h_state = h_tilde_state_skip * F.silu(z)
+
+#         # down-projection
+#         x = self.proj_down(h_state)
+
+#         # reverse alternating flip
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_TOP_LEFT:
+#             pass
+#         elif self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             x = x.flip(dims=[1])
+#         else:
+#             raise NotImplementedError
+
+#         return x
+
+#     def reset_parameters(self):
+#         # init inproj
+#         small_init_(self.proj_up.weight, dim=self.dim)
+#         if self.proj_up.bias is not None:
+#             nn.init.zeros_(self.proj_up.bias)
+#         # init outproj (original mLSTM uses num_blocks=1)
+#         wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=1)
+#         if self.proj_down.bias is not None:
+#             nn.init.zeros_(self.proj_down.bias)
+
+#         nn.init.ones_(self.learnable_skip)
+
+#         def _init_qkv_proj(qkv_proj: LinearHeadwiseExpand):
+#             # use the embedding dim instead of the inner embedding dim
+#             small_init_(qkv_proj.weight, dim=self.dim)
+#             if qkv_proj.bias is not None:
+#                 nn.init.zeros_(qkv_proj.bias)
+
+#         _init_qkv_proj(self.q_proj)
+#         _init_qkv_proj(self.k_proj)
+#         _init_qkv_proj(self.v_proj)
+
+#         self.mlstm_cell.reset_parameters()
+
+
+class FeedForward(nn.Module):
+    def __init__(
+        self,
+        embedding_dim,
+        ffn_proj_factor=2.6667,
+        ffn_round_up_to_multiple_of=64,
+        use_bias=True,
+        weight_mode="fused",
+        num_blocks=1,
+    ):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.ffn_proj_factor = ffn_proj_factor
+        self.ffn_round_up_to_multiple_of = ffn_round_up_to_multiple_of
+        self.use_bias = use_bias
+        self.weight_mode = weight_mode
+        self.num_blocks = num_blocks
+
+        self.up_proj_dim = round_up_to_next_multiple_of(
+            embedding_dim * ffn_proj_factor,
+            ffn_round_up_to_multiple_of,
+        )
+
+        if self.weight_mode == "single":
+            self.proj_up_gate = nn.Linear(
+                in_features=embedding_dim,
+                out_features=self.up_proj_dim,
+                bias=use_bias,
+            )
+            self.proj_up = nn.Linear(
+                in_features=embedding_dim,
+                out_features=self.up_proj_dim,
+                bias=use_bias,
+            )
+        elif self.weight_mode == "fused":
+            self.proj_up_gate_z = nn.Linear(
+                in_features=embedding_dim,
+                out_features=2 * self.up_proj_dim,
+                bias=use_bias,
+            )
+
+        self.proj_down = nn.Linear(
+            in_features=self.up_proj_dim,
+            out_features=embedding_dim,
+            bias=use_bias,
+        )
+
+        self.act_fn = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.weight_mode == "single":
+            x = self.act_fn(self.proj_up_gate(x)) * self.proj_up(x)
+        elif self.weight_mode == "fused":
+            x = self.proj_up_gate_z(x)
+            gate, z = torch.tensor_split(x, (self.up_proj_dim,), dim=-1)
+            x = self.act_fn(gate) * z
+
+        y = self.proj_down(x)
+        return y
+
+    def reset_parameters(self):
+        if self.weight_mode == "fused":
+            small_init_(self.proj_up_gate_z.weight, dim=self.embedding_dim)
+            if self.proj_up_gate_z.bias is not None:
+                nn.init.zeros_(self.proj_up_gate_z.bias)
+        elif self.weight_mode == "single":
+            small_init_(self.proj_up_gate.weight, dim=self.embedding_dim)
+            small_init_(self.proj_up.weight, dim=self.embedding_dim)
+            if self.proj_up_gate.bias is not None:
+                nn.init.zeros_(self.proj_up_gate.bias)
+            if self.proj_up.bias is not None:
+                nn.init.zeros_(self.proj_up.bias)
+
+        wang_init_(
+            self.proj_down.weight,
+            dim=self.embedding_dim,
+            num_blocks=self.num_blocks or 1,
+        )
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
+
 class ViLLayer(nn.Module):
     def __init__(
             self,
@@ -358,9 +736,19 @@ class ViLLayer(nn.Module):
             direction,
             expansion=2,
             qkv_block_size=4,
-            proj_bias=False,
+            proj_bias=True,
+            norm_bias=True,
             conv_bias=True,
-            kernel_size=4,
+            conv_kernel_size=3,
+            conv_kind="2d",
+            init_weights="original",
+            seqlens=None,
+            num_blocks=None,
+            gate_soft_cap=15.0,
+            ffn_proj_factor=2.6667,
+            ffn_round_up_to_multiple_of=64,
+            weight_mode="fused",
+            chunk_size=64
     ):
         super().__init__()
         assert dim % qkv_block_size == 0
@@ -368,116 +756,108 @@ class ViLLayer(nn.Module):
         self.direction = direction
         self.expansion = expansion
         self.qkv_block_size = qkv_block_size
-        self.proj_bias = proj_bias
-        self.conv_bias = conv_bias
-        self.kernel_size = kernel_size
+        self.gate_soft_cap = gate_soft_cap
+        self.weight_mode = weight_mode
+        self.num_blocks = num_blocks
 
         inner_dim = expansion * dim
         num_heads = inner_dim // qkv_block_size
-        self.proj_up = nn.Linear(
-            in_features=dim,
-            out_features=2 * inner_dim,
-            bias=proj_bias,
-        )
-        self.q_proj = LinearHeadwiseExpand(
-            dim=inner_dim,
-            num_heads=num_heads,
-            bias=proj_bias,
-        )
-        self.k_proj = LinearHeadwiseExpand(
-            dim=inner_dim,
-            num_heads=num_heads,
-            bias=proj_bias,
-        )
-        self.v_proj = LinearHeadwiseExpand(
-            dim=inner_dim,
-            num_heads=num_heads,
-            bias=proj_bias,
-        )
 
-        self.conv1d = CausalConv1d(
-            dim=inner_dim,
-            kernel_size=kernel_size,
-            bias=conv_bias,
-        )
+        self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
+        self.qkv_proj = nn.Linear(inner_dim, 3 * inner_dim, bias=proj_bias)
+
+        if conv_kind == "causal1d":
+            self.conv = CausalConv1d(inner_dim, kernel_size=conv_kernel_size, bias=conv_bias)
+        elif conv_kind == "2d":
+            assert conv_kernel_size % 2 == 1
+            self.conv = SequenceConv2d(
+                inner_dim, inner_dim, kernel_size=conv_kernel_size,
+                padding=conv_kernel_size // 2, groups=inner_dim,
+                bias=conv_bias, seqlens=seqlens
+            )
+        else:
+            raise NotImplementedError
+
         self.mlstm_cell = MatrixLSTMCell(
             dim=inner_dim,
             num_heads=qkv_block_size,
+            norm_bias=norm_bias,
+            eps=1e-5
         )
-        self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
 
-        self.proj_down = nn.Linear(
-            in_features=inner_dim,
-            out_features=dim,
-            bias=proj_bias,
+        self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
+        self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
+
+        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+
+        self.ffn = FeedForward(
+            embedding_dim=dim,
+            ffn_proj_factor=ffn_proj_factor,
+            ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+            use_bias=proj_bias,
+            weight_mode=weight_mode,
+            num_blocks=num_blocks or 1,
         )
+
         self.reset_parameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        B, S, _ = x.shape
+        residual = x
+        x = self.norm(x)
 
-        # alternate direction in successive layers
-        if self.direction == SequenceTraversal.ROWWISE_FROM_TOP_LEFT:
-            pass
-        elif self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x = x.flip(dims=[1])
-        else:
-            raise NotImplementedError
 
-        # up-projection
         x_inner = self.proj_up(x)
-        x_mlstm, z = torch.chunk(x_inner, chunks=2, dim=-1)
+        x_mlstm, z = torch.chunk(x_inner, 2, dim=-1)
 
-        # mlstm branch
-        x_mlstm_conv = self.conv1d(x_mlstm)
-        x_mlstm_conv_act = F.silu(x_mlstm_conv)
-        q = self.q_proj(x_mlstm_conv_act)
-        k = self.k_proj(x_mlstm_conv_act)
-        v = self.v_proj(x_mlstm)
+        x_mlstm_conv_act = F.silu(self.conv(x_mlstm))
+
+        # fused QKV projections
+        qkv = self.qkv_proj(x_mlstm_conv_act)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+
         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
         h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_mlstm_conv_act)
 
-        # output / z branch
         h_state = h_tilde_state_skip * F.silu(z)
 
-        # down-projection
         x = self.proj_down(h_state)
 
-        # reverse alternating flip
-        if self.direction == SequenceTraversal.ROWWISE_FROM_TOP_LEFT:
-            pass
-        elif self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x = x.flip(dims=[1])
-        else:
-            raise NotImplementedError
+
+        x = residual + x
+
+        # FFN with residual
+        ffn_residual = x
+        x_ffn = self.ffn_norm(x)
+        x_ffn = self.ffn(x_ffn)
+        x = ffn_residual + x_ffn
 
         return x
 
     def reset_parameters(self):
-        # init inproj
-        small_init_(self.proj_up.weight, dim=self.dim)
+        small_init_(self.proj_up.weight, self.dim)
         if self.proj_up.bias is not None:
             nn.init.zeros_(self.proj_up.bias)
-        # init outproj (original mLSTM uses num_blocks=1)
-        wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=1)
+
+        small_init_(self.qkv_proj.weight, self.dim)
+        if self.qkv_proj.bias is not None:
+            nn.init.zeros_(self.qkv_proj.bias)
+
+        wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
         if self.proj_down.bias is not None:
             nn.init.zeros_(self.proj_down.bias)
 
         nn.init.ones_(self.learnable_skip)
-
-        def _init_qkv_proj(qkv_proj: LinearHeadwiseExpand):
-            # use the embedding dim instead of the inner embedding dim
-            small_init_(qkv_proj.weight, dim=self.dim)
-            if qkv_proj.bias is not None:
-                nn.init.zeros_(qkv_proj.bias)
-
-        _init_qkv_proj(self.q_proj)
-        _init_qkv_proj(self.k_proj)
-        _init_qkv_proj(self.v_proj)
-
         self.mlstm_cell.reset_parameters()
+        self.norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
+        self.ffn.reset_parameters()
 
-
+#GPT 4.5 refactor
 class ViLBlock(nn.Module):
     def __init__(self, dim, direction, drop_path=0.0, norm_bias=False):
         super().__init__()
@@ -493,7 +873,7 @@ class ViLBlock(nn.Module):
         self.reset_parameters()
 
     def _forward_path(self, x):
-        x = self.norm(x)
+        #x = self.norm(x)
         x = self.layer(x)
         return x
 
@@ -504,6 +884,35 @@ class ViLBlock(nn.Module):
     def reset_parameters(self):
         self.layer.reset_parameters()
         self.norm.reset_parameters()
+
+
+
+# class ViLBlock(nn.Module):
+#     def __init__(self, dim, direction, drop_path=0.0, norm_bias=False):
+#         super().__init__()
+#         self.dim = dim
+#         self.direction = direction
+#         self.drop_path = drop_path
+#         self.norm_bias = norm_bias
+
+#         self.drop_path = DropPath(drop_prob=drop_path)
+#         self.norm = LayerNorm(ndim=dim, weight=True, bias=norm_bias)
+#         self.layer = ViLLayer(dim=dim, direction=direction)
+
+#         self.reset_parameters()
+
+#     def _forward_path(self, x):
+#         x = self.norm(x)
+#         x = self.layer(x)
+#         return x
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         x = self.drop_path(x, self._forward_path)
+#         return x
+
+#     def reset_parameters(self):
+#         self.layer.reset_parameters()
+#         self.norm.reset_parameters()
 
 
 class VisionLSTM(nn.Module):
