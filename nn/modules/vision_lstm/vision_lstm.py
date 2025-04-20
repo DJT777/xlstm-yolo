@@ -334,6 +334,8 @@ class MatrixLSTMCell(nn.Module):
             lower_triangular_matrix=causal_mask,
         )  # (B, NH, S, DH)
 
+        print(torch.isnan(h_state).any())
+
         h_state_norm = self.outnorm(h_state)  # (B, NH, S, DH)
         h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, -1)  # (B, NH, S, DH) -> (B, S, NH, DH) -> (B, S, H)
 

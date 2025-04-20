@@ -47,7 +47,7 @@ class mLSTMVisionBlockConfig:
     # biases & norms
     use_bias: bool = False
     norm_eps: float = 1e-6
-    norm_reduction_force_float32: bool = True
+    norm_reduction_force_float32: bool = False
 
     # projection factors
     qk_dim_factor: float = 0.5
@@ -68,9 +68,9 @@ class mLSTMVisionBlockConfig:
     step_kernel: StepKernelType = "triton"
     mode: BackendModeType = "train"
     chunk_size: int = 64
-    autocast_kernel_dtype: DtypeType = "float32"
+    autocast_kernel_dtype: DtypeType = "bfloat16"
     eps: float = 1e-6
-    inference_state_dtype: DtypeType = "float32"
+    inference_state_dtype: DtypeType = "bfloat16"
     seqlens: Optional[list[int]] = None
 
     mode = "train"
@@ -279,11 +279,16 @@ class mLSTMLayerVision(nn.Module):
             )
 
         # Reshape and transpose for multi-head processing
-        q = q.reshape(B, S, self.config.num_heads, -1).transpose(1, 2)
-        k = k.reshape(B, S, self.config.num_heads, -1).transpose(1, 2)
-        v = v.reshape(B, S, self.config.num_heads, -1).transpose(1, 2)
-        i_preact = i_preact.transpose(1, 2)
-        f_preact = f_preact.transpose(1, 2)
+        q = q.reshape(B, S, self.config.num_heads, -1).transpose(1, 2).contiguous()
+        k = k.reshape(B, S, self.config.num_heads, -1).transpose(1, 2).contiguous()
+        v = v.reshape(B, S, self.config.num_heads, -1).transpose(1, 2).contiguous()
+        i_preact = i_preact.transpose(1, 2).contiguous()
+        f_preact = f_preact.transpose(1, 2).contiguous()
+
+        # Also make any initial states contiguous if they exist
+        c0 = self._state[0].contiguous() if self._state is not None else None
+        n0 = self._state[1].contiguous() if self._state is not None else None
+        m0 = self._state[2].contiguous() if self._state is not None else None
 
         if self.config.return_last_states:
             # we know the kernel will return (H, (C_last, N_last, M_last))
@@ -413,7 +418,7 @@ class VilLayerUpdated(nn.Module):
         num_heads: int,
         use_bias: bool = False,
         norm_eps: float = 1e-6,
-        norm_reduction_force_float32: bool = True,
+        norm_reduction_force_float32: bool = False,
         qk_dim_factor: float = 0.5,
         v_dim_factor: float = 1.0,
         gate_soft_cap: float = 15.0,
@@ -428,7 +433,7 @@ class VilLayerUpdated(nn.Module):
         chunk_size: int = 64,
         autocast_kernel_dtype: DtypeType = "bfloat16",
         eps: float = 1e-6,
-        inference_state_dtype: DtypeType = "float32",
+        inference_state_dtype: DtypeType = "bfloat16",
         seqlens: Optional[list[int]] = None,
         direction: SequenceTraversal = SequenceTraversal.ROWWISE_FROM_TOP_LEFT,
         num_blocks = 1
