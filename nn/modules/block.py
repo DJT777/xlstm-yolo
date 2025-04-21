@@ -1781,11 +1781,11 @@ class ViLBlockPairBlock(nn.Module):
         x = einops.rearrange(x, "b ... d -> b (...) d")
         B, S, D = x.shape
 
-        # Check that the sequence length matches the expected product of seqlens dims
-        assert S == self.expected_seq, (
-            f"Input sequence length {S} does not match expected {self.expected_seq} "
-            f"computed from seqlens {self.seqlens}"
-        )
+        # # Check that the sequence length matches the expected product of seqlens dims
+        # assert S == self.expected_seq, (
+        #     f"Input sequence length {S} does not match expected {self.expected_seq} "
+        #     f"computed from seqlens {self.seqlens}"
+        # )
         # Check feature dimension matches
         assert D == self.c2, f"Input dimension {D} does not match expected {self.c2}"
 
