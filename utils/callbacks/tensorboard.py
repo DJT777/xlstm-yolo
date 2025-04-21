@@ -159,7 +159,7 @@ callbacks = ({
     "on_train_start":             on_train_start,
     "on_train_epoch_start":       on_train_epoch_start,
     "on_train_batch_start":       on_train_batch_start,
-    "on_train_batch_end":         log_histograms,
+    #"on_train_batch_end":         log_histograms,
     "on_train_epoch_end":         on_train_epoch_end,
     "on_fit_epoch_end":           on_fit_epoch_end,
 } if SummaryWriter else {})

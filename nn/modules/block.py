@@ -1689,7 +1689,7 @@ class VitPosEmbedBlock(nn.Module):
         self.module = VitPosEmbed(
             seqlens=seqlens,
             dim=c2,
-            is_learnable=kwargs.get('is_learnable', False),
+            is_learnable=kwargs.get('is_learnable', True),
             allow_interpolation=kwargs.get('allow_interpolation', True),
             interpolate_offset=kwargs.get('interpolate_offset', None)
         )

@@ -341,9 +341,6 @@ class ViLLayer(nn.Module):
         self.norm.reset_parameters()
         self.ffn_norm.reset_parameters()
         self.ffn.reset_parameters()
-
-
-#gpt 4.5 - triton kernel
 class ViLLayer(nn.Module):
     def __init__(self,
             dim,
@@ -472,6 +469,9 @@ class ViLLayer(nn.Module):
         self.ffn.reset_parameters()
 
 
+
+
+
 #GPT 4.5 refactor
 class ViLBlock(nn.Module):
     def __init__(self,
@@ -590,6 +590,170 @@ class MatrixLSTMCell(nn.Module):
         # input gate initialization
         torch.nn.init.zeros_(self.igate.weight)
         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
+
+#grok backendsclass 
+from mlstm_kernels.torch.chunkwise.triton_xl_chunk import mlstm_chunkwise__xl_chunk
+class MatrixLSTMCell(nn.Module):
+        def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float32):
+            super().__init__()
+            self.dim = dim
+            self.num_heads = num_heads
+            self.use_autocast = use_autocast  # Added to enable/disable autocasting
+            self.autocast_dtype = autocast_dtype  # Added to specify autocast dtype
+
+            self.igate = nn.Linear(3 * dim, num_heads)
+            self.fgate = nn.Linear(3 * dim, num_heads)
+            self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias)
+            self.causal_mask_cache = {}
+            chunk_size = 16
+
+
+
+            # CPU-compatible backend configuration (remains float32)
+            self.cpu_backend_config_infer = mLSTMBackendConfig(
+                chunkwise_kernel="chunkwise--native_autograd",
+                sequence_kernel="native_sequence__native",
+                step_kernel="native",
+                chunk_size=int(chunk_size),
+                autocast_kernel_dtype="float32",
+                return_last_states=True,
+                mode="inference",
+            )
+            self.cpu_backend = mLSTMBackend(
+                config=self.cpu_backend_config_infer,
+            )
+
+            # GPU-compatible (Triton) backend configuration
+            self.gpu_backend_config_infer = mLSTMBackendConfig(
+                chunkwise_kernel="chunkwise--triton_xl_chunk",
+                sequence_kernel="native_sequence__triton",
+                step_kernel="triton",
+                chunk_size=int(chunk_size),
+                autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
+                return_last_states=True,
+                mode="inference"
+            )
+            self.gpu_backend = mLSTMBackend(
+                config=self.gpu_backend_config_infer,
+            )
+
+
+            # CPU-compatible backend configuration (remains float32)
+            self.cpu_backend_config = mLSTMBackendConfig(
+                chunkwise_kernel="chunkwise--native_autograd",
+                sequence_kernel="native_sequence__native",
+                step_kernel="native",
+                chunk_size=int(chunk_size),
+                autocast_kernel_dtype="float32",
+                return_last_states=False,
+                mode="train",
+            )
+            self.cpu_backend = mLSTMBackend(
+                config=self.cpu_backend_config,
+            )
+
+            # GPU-compatible (Triton) backend configuration
+            self.gpu_backend_config = mLSTMBackendConfig(
+                chunkwise_kernel="chunkwise--native_autograd",
+                sequence_kernel="native_sequence__native",
+                step_kernel="triton",
+                chunk_size=int(chunk_size),
+                autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
+                return_last_states=False,
+                mode="train"
+            )
+            self.gpu_backend = mLSTMBackend(
+                config=self.gpu_backend_config,
+            )
+
+            self.reset_parameters()
+
+
+        def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            B, S, H = q.shape  # (B, S, H)
+            # print("Input type" + str(q.dtype))
+            dtype = q.dtype
+            device = q.device
+
+            # All inputs must reside on the same device
+            if not (q.device == k.device == v.device):
+                raise ValueError("All input tensors (q, k, v) must be on the same device.")
+            backend = self.gpu_backend if device.type == 'cuda' else self.cpu_backend
+
+            # Prepare gate inputs
+            if_gate_input = torch.cat([q, k, v], dim=-1)
+            i = self.igate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
+            f = self.fgate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
+
+            # Reshape for backend
+            q = q.view(B, S, self.num_heads, -1).transpose(1, 2)
+            k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
+            v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
+
+            # Compute h_state with the selected backend, applying autocast if specified
+            if device.type == 'cuda' and self.use_autocast and self.train:
+                q = q.to(self.autocast_dtype).contiguous()
+                k = k.to(self.autocast_dtype).contiguous()
+                v = v.to(self.autocast_dtype).contiguous()
+                i = i.to(self.autocast_dtype).contiguous()
+                f = f.to(self.autocast_dtype).contiguous()
+                # print("Autocast type" + str(q.dtype))
+                h_state = backend(
+                    q=q,
+                    k=k,
+                    v=v,
+                    i=i,
+                    f=f,
+                )  
+            elif device.type == 'cpu' and self.train:
+                h_state = backend(
+                    q=q,
+                    k=k,
+                    v=v,
+                    i=i,
+                    f=f,
+                )  # (B, NH, S, DH)
+                        # Compute h_state with the selected backend, applying autocast if specified
+            if device.type == 'cuda' and self.use_autocast and not self.training:
+                q = q.to(self.autocast_dtype).contiguous()
+                k = k.to(self.autocast_dtype).contiguous()
+                v = v.to(self.autocast_dtype).contiguous()
+                i = i.to(self.autocast_dtype).contiguous()
+                f = f.to(self.autocast_dtype).contiguous()
+                h_state = backend(
+                    q=q,
+                    k=k,
+                    v=v,
+                    i=i,
+                    f=f,
+                )  # (B, NH, S, DH)
+            elif device.type == 'cpu' and not self.training:
+                h_state, _ = backend(
+                    q=q,
+                    k=k,
+                    v=v,
+                    i=i,
+                    f=f,
+                )  # (B, NH, S, DH)
+
+            h_state = h_state.to(dtype)
+            h_state_norm = self.outnorm(h_state)  # (B, NH, S, DH)
+            h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, -1)  # (B, NH, S, DH) -> (B, S, NH, DH) -> (B, S, H)
+
+            # print("Output type" + str(h_state.dtype))
+            # Force output to match input dtype
+            return h_state_norm
+
+        def reset_parameters(self):
+            self.outnorm.reset_parameters()
+            # Forget gate initialization
+            torch.nn.init.zeros_(self.fgate.weight)
+            bias_linspace_init_(self.fgate.bias, start=3.0, end=6.0)
+            # Input gate initialization
+            torch.nn.init.zeros_(self.igate.weight)
+            torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
+
+
 
 class MultiHeadRMSNorm(nn.Module):
     def __init__(self, num_heads: int, head_dim: int, eps: float = 1e-6, affine: bool = True):
