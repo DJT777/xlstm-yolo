@@ -386,7 +386,7 @@ class ViLBlock(nn.Module):
         self.norm_bias = norm_bias
 
         self.drop_path = DropPath(drop_prob=drop_path)
-        self.norm = nn.RMSNorm(dim)
+        self.norm = nn.RMSNorm(dim, eps=1e-3)
         self.layer = ViLLayer(dim,
                                 direction,
                                 qkv_block_size=16,
@@ -404,7 +404,7 @@ class ViLBlock(nn.Module):
         self.reset_parameters()
 
     def _forward_path(self, x):
-        #x = self.norm(x)
+        x = self.norm(x)
         x = self.layer(x)
         return x
 
@@ -505,6 +505,7 @@ class MatrixLSTMCell(nn.Module):
                 autocast_kernel_dtype="float32",
                 return_last_states=True,
                 mode="inference",
+                eps=1e-5
             )
             self.cpu_backend = mLSTMBackend(
                 config=self.cpu_backend_config_infer,
@@ -512,13 +513,14 @@ class MatrixLSTMCell(nn.Module):
 
             # GPU-compatible (Triton) backend configuration
             self.gpu_backend_config_infer = mLSTMBackendConfig(
-                chunkwise_kernel="chunkwise--triton_limit_chunk",
+                chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
                 sequence_kernel="native_sequence__triton",
                 step_kernel="triton",
                 chunk_size=int(chunk_size),
                 autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
                 return_last_states=True,
-                mode="inference"
+                mode="inference",
+                eps=1e-5
             )
             self.gpu_backend = mLSTMBackend(
                 config=self.gpu_backend_config_infer,
@@ -534,6 +536,7 @@ class MatrixLSTMCell(nn.Module):
                 autocast_kernel_dtype="float32",
                 return_last_states=False,
                 mode="train",
+                eps=1e-5
             )
             self.cpu_backend = mLSTMBackend(
                 config=self.cpu_backend_config,
@@ -541,13 +544,14 @@ class MatrixLSTMCell(nn.Module):
 
             # GPU-compatible (Triton) backend configuration
             self.gpu_backend_config = mLSTMBackendConfig(
-                chunkwise_kernel="chunkwise--triton_limit_chunk",
+                chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
                 sequence_kernel="native_sequence__triton",
                 step_kernel="triton",
                 chunk_size=int(chunk_size),
                 autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
                 return_last_states=False,
-                mode="train"
+                mode="train",
+                eps=1e-5
             )
             self.gpu_backend = mLSTMBackend(
                 config=self.gpu_backend_config,
@@ -615,7 +619,7 @@ class MatrixLSTMCell(nn.Module):
                     f=f,
                 )  # (B, NH, S, DH)
             elif device.type == 'cpu' and not self.training:
-                h_state, _ = backend(
+                h_state = backend(
                     q=q,
                     k=k,
                     v=v,
