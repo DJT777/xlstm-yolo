@@ -9,7 +9,7 @@ from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
-from .vision_lstm.vision_lstm2 import VitPatchEmbed, VitPosEmbed2d, ViLBlockPair, SequenceConv2d, LayerNorm, MultiHeadLayerNorm
+from .vision_lstm.vision_lstm2 import VitPatchEmbed, VitPosEmbed2d, ViLBlockPair, SequenceConv2d, LayerNorm, MultiHeadLayerNorm, MultiHeadRMSNorm
 from .vision_lstm.vision_lstm_hierarchical import PatchMerge, MultiScaleFusion
 from .vision_lstm.vision_lstm_util import VitPosEmbed, DropPath  # Adjust import path as needed
   # run once, before Ultralytics builds the optimiser
@@ -66,7 +66,8 @@ __all__ = (
     "PatchMergeBlock",
     "XViLBlockPairBlock"
     "ViLFusionBlock"
-    "ViLLayerNormBlock"
+    "ViLLayerNormBlock",
+    "PatchMerger"
 )
 
 
@@ -1688,7 +1689,7 @@ class VitPosEmbedBlock(nn.Module):
         self.module = VitPosEmbed(
             seqlens=seqlens,
             dim=c2,
-            is_learnable=kwargs.get('is_learnable', False),
+            is_learnable=kwargs.get('is_learnable', True),
             allow_interpolation=kwargs.get('allow_interpolation', True),
             interpolate_offset=kwargs.get('interpolate_offset', None)
         )
@@ -1780,11 +1781,11 @@ class ViLBlockPairBlock(nn.Module):
         x = einops.rearrange(x, "b ... d -> b (...) d")
         B, S, D = x.shape
 
-        # Check that the sequence length matches the expected product of seqlens dims
-        assert S == self.expected_seq, (
-            f"Input sequence length {S} does not match expected {self.expected_seq} "
-            f"computed from seqlens {self.seqlens}"
-        )
+        # # Check that the sequence length matches the expected product of seqlens dims
+        # assert S == self.expected_seq, (
+        #     f"Input sequence length {S} does not match expected {self.expected_seq} "
+        #     f"computed from seqlens {self.seqlens}"
+        # )
         # Check feature dimension matches
         assert D == self.c2, f"Input dimension {D} does not match expected {self.c2}"
 
@@ -2278,6 +2279,19 @@ class ViLFusionBlock(nn.Module):
 
         return x
 
+# Definition of the PatchMerger class
+class PatchMerger(nn.Module):
+    def __init__(self, dim, num_tokens_out):
+        super().__init__()
+        self.scale = dim ** -0.5
+        self.norm = nn.LayerNorm(dim)
+        self.queries = nn.Parameter(torch.randn(num_tokens_out, dim))
+
+    def forward(self, x):
+        x = self.norm(x)
+        sim = torch.matmul(self.queries, x.transpose(-1, -2)) * self.scale
+        attn = sim.softmax(dim=-1)
+        return torch.matmul(attn, x)
 
 # class ViLFusionBlock(nn.Module):
 #     class _LocalSpatial(nn.Module):
@@ -2490,3 +2504,4 @@ class ViLFusionBlock(nn.Module):
 nn.ViLLayerNormBlock = ViLLayerNormBlock
 nn.ViLInternalNorm = LayerNorm 
 nn.ViLInternalMultiHeadNorm = MultiHeadLayerNorm 
+nn.MultiHeadRMSNorm = MultiHeadRMSNorm
