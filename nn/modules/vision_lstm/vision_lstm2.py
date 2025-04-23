@@ -389,7 +389,7 @@ class ViLBlock(nn.Module):
         self.norm = nn.RMSNorm(dim, eps=1e-3)
         self.layer = ViLLayer(dim,
                                 direction,
-                                qkv_block_size=16,
+                                qkv_block_size=32,
                                 proj_bias=True,
                                 norm_bias=True,
                                 conv_bias=True,
