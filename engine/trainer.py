@@ -6,6 +6,9 @@ Usage:
     $ yolo mode=train model=yolo11n.pt data=coco8.yaml imgsz=640 epochs=100 batch=16
 """
 
+from .ademamix import AdEMAMix
+
+
 import gc
 import math
 import os
@@ -761,6 +764,7 @@ class BaseTrainer:
             LOGGER.info("Closing dataloader mosaic")
             self.train_loader.dataset.close_mosaic(hyp=copy(self.args))
 
+
     def build_optimizer(self, model, name="auto", lr=0.001, momentum=0.9, decay=1e-5, iterations=1e5):
         """
         Constructs an optimizer for the given model, based on the specified optimizer name, learning rate, momentum,
@@ -779,6 +783,7 @@ class BaseTrainer:
         Returns:
             (torch.optim.Optimizer): The constructed optimizer.
         """
+        print(name)
         g = [], [], []  # optimizer parameter groups
         bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
         if name == "auto":
@@ -802,7 +807,7 @@ class BaseTrainer:
                 else:  # weight (with decay)
                     g[0].append(param)
 
-        optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "auto"}
+        optimizers = {"Adam", "Adamax", "AdamW", "NAdam", "RAdam", "RMSProp", "SGD", "AdEMAMix", "auto"}
         name = {x.lower(): x for x in optimizers}.get(name.lower())
         if name in {"Adam", "Adamax", "AdamW", "NAdam", "RAdam"}:
             optimizer = getattr(optim, name, optim.Adam)(g[2], lr=lr, betas=(momentum, 0.999), weight_decay=0.0)
@@ -810,10 +815,20 @@ class BaseTrainer:
             optimizer = optim.RMSprop(g[2], lr=lr, momentum=momentum)
         elif name == "SGD":
             optimizer = optim.SGD(g[2], lr=lr, momentum=momentum, nesterov=True)
+        elif name == "AdEMAMix":
+            optimizer = AdEMAMix(
+                params=g[2],
+                lr=lr,
+                betas=(momentum, 0.999, 0.9999),
+                alpha=8.0,
+                beta3_warmup=iterations,
+                alpha_warmup=iterations,
+                weight_decay=0.0
+            )
         else:
             raise NotImplementedError(
                 f"Optimizer '{name}' not found in list of available optimizers {optimizers}. "
-                "Request support for addition optimizers at https://github.com/ultralytics/ultralytics."
+                "Request support for additional optimizers at https://github.com/ultralytics/ultralytics."
             )
 
         optimizer.add_param_group({"params": g[0], "weight_decay": decay})  # add g0 with weight_decay

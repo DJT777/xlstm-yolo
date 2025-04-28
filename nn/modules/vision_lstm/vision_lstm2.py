@@ -389,7 +389,7 @@ class ViLBlock(nn.Module):
         self.norm = nn.RMSNorm(dim, eps=1e-3)
         self.layer = ViLLayer(dim,
                                 direction,
-                                qkv_block_size=32,
+                                qkv_block_size=qkv_block_size,
                                 proj_bias=True,
                                 norm_bias=True,
                                 conv_bias=True,
@@ -619,7 +619,7 @@ class MatrixLSTMCell(nn.Module):
                     f=f,
                 )  # (B, NH, S, DH)
             elif device.type == 'cpu' and not self.training:
-                h_state, _ = backend(
+                h_state = backend(
                     q=q,
                     k=k,
                     v=v,
@@ -913,7 +913,7 @@ class ViLBlockPair(nn.Module):
             num_blocks=num_blocks,
             init_weights=init_weights,
             chunk_size=chunk_size,
-            qkv_block_size = 4
+            qkv_block_size = qkv_block_size
         )
         self.rowwise_from_bot_right = ViLBlock(
             dim=dim,
@@ -927,7 +927,7 @@ class ViLBlockPair(nn.Module):
             num_blocks=num_blocks,
             init_weights=init_weights,
             chunk_size=chunk_size,
-            qkv_block_size = 4
+            qkv_block_size = qkv_block_size
         )
 
     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:

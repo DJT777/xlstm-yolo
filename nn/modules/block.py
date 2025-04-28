@@ -1747,15 +1747,16 @@ class ViLBlockPairBlock(nn.Module):
         # print(seqlens)
         # print(config.get("chunk_size", 256))
         # Initialize the underlying ViLBlockPair without hidden state management
+        print("BLOCK SIZE " + str(config.get("qkv_block_size", 16)))
         self.module = ViLBlockPair(
             dim=c2,
-            drop_path=config.get("drop_path", 0.0),
+            drop_path=config.get("drop_path", 0.02),
             conv_kind=config.get("conv_kind", "2d"),
             conv_kernel_size=config.get("conv_kernel_size", 3),
             proj_bias=config.get("proj_bias", True),
             norm_bias=config.get("norm_bias", True),
             seqlens=seqlens,
-            qkv_block_size = config.get("qkv_block_size", 4),
+            qkv_block_size = config.get("qkv_block_size", 16),
             num_blocks=config.get("num_blocks", None),
             init_weights=config.get("init_weights", "original"),
             chunk_size=config.get("chunk_size", 256),
