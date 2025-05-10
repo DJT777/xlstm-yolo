@@ -141,7 +141,7 @@ class FeedForward(nn.Module):
         ffn_round_up_to_multiple_of=64,
         use_bias=True,
         weight_mode="fused",
-        num_blocks=12,
+        num_blocks=15,
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -228,7 +228,7 @@ class ViLLayer(nn.Module):
             conv_kind="2d",
             init_weights="original-fixed",
             seqlens=None,
-            num_blocks=12,
+            num_blocks=15,
             gate_soft_cap=15.0,
             ffn_proj_factor=2.6667,
             ffn_round_up_to_multiple_of=64,
@@ -236,6 +236,7 @@ class ViLLayer(nn.Module):
             chunk_size=64
     ):
         super().__init__()
+        #print(chunk_size)
         assert dim % qkv_block_size == 0
         self.dim = dim
         self.direction = direction
@@ -282,7 +283,8 @@ class ViLLayer(nn.Module):
             dim=inner_dim,
             num_heads=num_heads,
             norm_bias=norm_bias,
-            eps=1e-5
+            eps=1e-5,
+            chunk_size=chunk_size
         )
 
         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
@@ -367,7 +369,7 @@ class ViLBlock(nn.Module):
     def __init__(self,
         dim,
         direction,
-        drop_path=0.2,
+        drop_path=0.0,
         conv_kind="2d",
         conv_kernel_size=3,
         proj_bias=True,
@@ -385,7 +387,7 @@ class ViLBlock(nn.Module):
         self.drop_path = drop_path
         self.norm_bias = norm_bias
 
-        self.drop_path = DropPath(drop_prob=drop_path)
+        self.drop_path = DropPath(drop_prob=0.0)
         self.norm = nn.RMSNorm(dim, eps=1e-3)
         self.layer = ViLLayer(dim,
                                 direction,
@@ -398,18 +400,19 @@ class ViLBlock(nn.Module):
                                 init_weights="original",
                                 seqlens=None,  # Initial seqlens, can be overridden in forward
                                 num_blocks=None,
-                                chunk_size=64,
+                                chunk_size=chunk_size,
                             )
 
         self.reset_parameters()
 
     def _forward_path(self, x):
-        x = self.norm(x)
+        #x = self.norm(x)
         x = self.layer(x)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.drop_path(x, self._forward_path)
+        # x = self.drop_path(x, self._forward_path)
+        x = self.layer(x)
         return x
 
     def reset_parameters(self):
@@ -492,7 +495,7 @@ class MatrixLSTMCell(nn.Module):
             self.fgate = nn.Linear(3 * dim, num_heads)
             self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-3)
             self.causal_mask_cache = {}
-            chunk_size = 64
+            chunk_size = chunk_size
 
 
 
@@ -505,7 +508,7 @@ class MatrixLSTMCell(nn.Module):
                 autocast_kernel_dtype="float32",
                 return_last_states=True,
                 mode="inference",
-                eps=1e-5
+                eps=5e-5
             )
             self.cpu_backend = mLSTMBackend(
                 config=self.cpu_backend_config_infer,
@@ -520,7 +523,7 @@ class MatrixLSTMCell(nn.Module):
                 autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
                 return_last_states=True,
                 mode="inference",
-                eps=1e-5
+                eps=5e-5
             )
             self.gpu_backend = mLSTMBackend(
                 config=self.gpu_backend_config_infer,
@@ -536,7 +539,7 @@ class MatrixLSTMCell(nn.Module):
                 autocast_kernel_dtype="float32",
                 return_last_states=False,
                 mode="train",
-                eps=1e-5
+                eps=5e-5
             )
             self.cpu_backend = mLSTMBackend(
                 config=self.cpu_backend_config,
@@ -551,7 +554,7 @@ class MatrixLSTMCell(nn.Module):
                 autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
                 return_last_states=False,
                 mode="train",
-                eps=1e-5
+                eps=5e-5
             )
             self.gpu_backend = mLSTMBackend(
                 config=self.gpu_backend_config,
@@ -642,7 +645,8 @@ class MatrixLSTMCell(nn.Module):
             bias_linspace_init_(self.fgate.bias, start=3.0, end=6.0)
             # Input gate initialization
             torch.nn.init.zeros_(self.igate.weight)
-            torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
+            torch.nn.init.constant_(self.igate.bias, -10)
+            #torch.nn.init.normal_(self.igate.bias, mean=-10, std=0.1)
 
 
 
@@ -895,7 +899,7 @@ class ViLBlockPair(nn.Module):
         proj_bias=True,
         norm_bias=True,
         seqlens=None,
-        num_blocks=None,
+        num_blocks=15,
         init_weights="original",
         chunk_size=256,
         qkv_block_size = 4

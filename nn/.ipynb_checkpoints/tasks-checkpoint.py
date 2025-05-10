@@ -73,7 +73,6 @@ from ultralytics.nn.modules import (
     SequenceConv2dBlock,
     PatchMergeBlock,
     VisionClueMerge,
-    XViLBlockPairBlock,
     ViLFusionBlock,
     ViLLayerNormBlock,
     PatchMerger
@@ -346,7 +345,7 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 640 # 2x min stride
+            s = 512 # 2x min stride
             m.inplace = self.inplace
 
             def _forward(x):
@@ -1204,11 +1203,6 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m in {ViLBlockPairBlock, ViLFusionBlock}:
             c1 = ch[f]            
             c2 = args[1]  # c2 from args3
-        elif m in {XViLBlockPairBlock}:
-            c1 = args[0]
-            c2 = args[1]
-            # print("C1 " + str(c1))
-            # print("C2 " + str(c2))
         elif m is VisionClueMerge:
             c1 = ch[f]
             c2 = args[1]  # c2 from args

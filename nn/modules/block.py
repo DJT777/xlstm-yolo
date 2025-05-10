@@ -64,7 +64,6 @@ __all__ = (
     "VitPosEmbed2dBlock",
     "ViLBlockPairBlock",
     "PatchMergeBlock",
-    "XViLBlockPairBlock"
     "ViLFusionBlock"
     "ViLLayerNormBlock",
     "PatchMerger"
@@ -1747,10 +1746,10 @@ class ViLBlockPairBlock(nn.Module):
         # print(seqlens)
         # print(config.get("chunk_size", 256))
         # Initialize the underlying ViLBlockPair without hidden state management
-        print("BLOCK SIZE " + str(config.get("qkv_block_size", 16)))
+        #print("BLOCK SIZE " + str(config.get("qkv_block_size", 16)))
         self.module = ViLBlockPair(
             dim=c2,
-            drop_path=config.get("drop_path", 0.02),
+            drop_path=config.get("drop_path", 0.00),
             conv_kind=config.get("conv_kind", "2d"),
             conv_kernel_size=config.get("conv_kernel_size", 3),
             proj_bias=config.get("proj_bias", True),
@@ -1989,113 +1988,7 @@ class PatchMerger(nn.Module):
         y = torch.einsum('bmn,bnd->bmd', attention, x)  # (B, M, D)
         return y
     
-class XViLBlockPairBlock(nn.Module):
-    """
-    An adapted block for VisionLSTM that processes concatenated feature maps for object detection.
-    Scales down input channels before processing with ViLBlockPair, returning output in 4D format.
-
-    Args:
-        c1 (int): Input channel dimension (e.g., 1536 from concatenation).
-        c2 (int): Output channel dimension (e.g., 512).
-        config (dict): Configuration dictionary with keys like 'seqlens', 'chunk_size', etc.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        # print("XVIL ARGS")
-        # print(args)
-        # Handle args from YAML parsing
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            args = args[0]
-
-        
-        c1, c2, config = args if len(args) > 2 else (args[0], args[1], {})
-
-        self.c1 = c1  # Input channels (e.g., concatenated channels)
-        self.c2 = c2  # Output channels (dim)
-        self.config = config
-
-        # print("INNER C1 " + str(c1))
-        # print("INNER C2 " + str(c2))
-
-        # Extract sequence lengths (e.g., [H, W] for 2D or [T, H, W] for 3D)
-        seqlens = config.get("seqlens")
-        if not seqlens:
-            raise ValueError("seqlens is required in config for XViLBlockPairBlock")
-        if not isinstance(seqlens, (list, tuple)):
-            raise ValueError("seqlens must be a list or tuple")
-
-        # Determine mode and compute expected sequence length
-        if len(seqlens) == 2:
-            self.mode = "2d"
-            self.expected_seq = seqlens[0] * seqlens[1]  # H * W
-        elif len(seqlens) == 3:
-            self.mode = "3d"
-            self.expected_seq = seqlens[0] * seqlens[1] * seqlens[2]  # T * H * W
-            if config.get("conv_kind", "2d") != "3d":
-                config["conv_kind"] = "3d"
-        else:
-            raise ValueError("seqlens must be a list/tuple of length 2 (2D) or 3 (3D)")
-
-        # Input projection to scale down channels (like XSSBlock's in_proj)
-        if c1 != c2:
-            self.in_proj = nn.Sequential(
-                nn.Conv2d(c1, c2, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.BatchNorm2d(c2),
-                nn.SiLU()
-            )
-        else:
-            self.in_proj = nn.Identity()
-
-        # Underlying ViLBlockPair
-        self.module = ViLBlockPair(
-            dim=c2,
-            drop_path=config.get("drop_path", 0.0),
-            conv_kind=config.get("conv_kind", "2d"),
-            conv_kernel_size=config.get("conv_kernel_size", 3),
-            proj_bias=config.get("proj_bias", True),
-            norm_bias=config.get("norm_bias", True),
-            seqlens=seqlens,
-            num_blocks=config.get("num_blocks", None),
-            init_weights=config.get("init_weights", "original"),
-            chunk_size=config.get("chunk_size", 256),
-        )
-        self.seqlens = seqlens  # Store for reference
-
-    def forward(self, x):
-        """
-        Forward pass of the block, processing 4D input and returning 4D output tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C_in, H, W).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, c2, H, W).
-        """
-        if not isinstance(x, torch.Tensor):
-            raise ValueError(f"Expected x to be a torch.Tensor, got {type(x)}")
-
-        # Input shape: (B, C_in, H, W)
-        B, C_in, H, W = x.shape
-        assert C_in == self.c1, f"Input channels {C_in} must match c1 {self.c1}"
-
-        # Scale down channels
-        x = self.in_proj(x)  # (B, c2, H, W)
-
-        # Flatten to sequence
-        S = H * W if self.mode == "2d" else H * W * self.seqlens[0]
-        x_seq = x.view(B, self.c2, -1).permute(0, 2, 1)  # (B, S, c2)
-        assert x_seq.shape[1] == self.expected_seq, (
-            f"Sequence length {x_seq.shape[1]} does not match expected {self.expected_seq}"
-        )
-
-        # Process with ViLBlockPair
-        out_seq = self.module(x_seq)  # (B, S, c2)
-
-        # Reshape back to 4D
-        out = out_seq.permute(0, 2, 1).view(B, self.c2, H, W)  # (B, c2, H, W)
-        return out
     
-
 
 class RGBlock(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,
@@ -2192,6 +2085,7 @@ class ViLFusionBlock(nn.Module):
         # print(config)
         # Extract seqlens from config
         seqlens = config.get("seqlens")
+        # mlp_ratio = config.get("mlp_ratio")
         if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
             raise ValueError("config['seqlens'] must be a list/tuple of length 2 or 3")
 
@@ -2211,7 +2105,7 @@ class ViLFusionBlock(nn.Module):
         self.lsblock = LSBlock(hidden_dim, hidden_dim)
 
         # Normalization for sequence input (B, S, D)
-        self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+        self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
 
         # ViLBlockPairBlock replacing SS2D
         self.vil = nn.Sequential(*[
@@ -2225,6 +2119,7 @@ class ViLFusionBlock(nn.Module):
         # Optional MLP branch (same as XSSBlock)
         self.mlp_branch = mlp_ratio > 0
         if self.mlp_branch:
+            #print("MLP EXISTS!")
             self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)  # Sequence norm
             mlp_hidden_dim = int(hidden_dim * mlp_ratio)
             self.mlp = RGBlock(
@@ -2255,8 +2150,8 @@ class ViLFusionBlock(nn.Module):
         seq = einops.rearrange(x_local, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
 
         # Normalize and process with ViLBlockPairBlock
-        seq_norm = self.norm(seq)  # (B, S, hidden_dim)
-        seq_out = self.vil(seq_norm)  # (B, S, hidden_dim)
+        #seq_norm = self.norm(seq)  # (B, S, hidden_dim)
+        seq_out = self.vil(seq)  # (B, S, hidden_dim)
 
         # Apply drop path and residual connection in sequence space
         seq = seq + self.drop_path(seq_out)  # (B, S, hidden_dim)
