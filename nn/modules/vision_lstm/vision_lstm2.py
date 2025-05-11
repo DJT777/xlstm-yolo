@@ -4,6 +4,7 @@
 import math
 import warnings
 from enum import Enum
+import math
 
 import einops
 import torch
@@ -133,6 +134,28 @@ def parallel_stabilized_simple(
     return h_tilde_state
 
 
+class RGBlock(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,
+                 channels_first=False):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        hidden_features = int(2 * hidden_features / 3)
+        self.fc1 = nn.Conv2d(in_features, hidden_features * 2, kernel_size=1)
+        self.dwconv = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1, bias=True,
+                                groups=hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x, v = self.fc1(x).chunk(2, dim=1)
+        x = self.act(self.dwconv(x) + x) * v
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -141,7 +164,7 @@ class FeedForward(nn.Module):
         ffn_round_up_to_multiple_of=64,
         use_bias=True,
         weight_mode="fused",
-        num_blocks=12,
+        num_blocks=15,
     ):
         super().__init__()
         self.embedding_dim = embedding_dim
@@ -214,6 +237,152 @@ class FeedForward(nn.Module):
         if self.proj_down.bias is not None:
             nn.init.zeros_(self.proj_down.bias)
 
+# #grok-original logic
+# class ViLLayer(nn.Module):
+#     def __init__(self,
+#             dim,
+#             direction,
+#             expansion=2,
+#             qkv_block_size=4,
+#             proj_bias=True,
+#             norm_bias=True,
+#             conv_bias=True,
+#             conv_kernel_size=3,
+#             conv_kind="2d",
+#             init_weights="original-fixed",
+#             seqlens=None,
+#             num_blocks=15,
+#             gate_soft_cap=15.0,
+#             ffn_proj_factor=2.6667,
+#             ffn_round_up_to_multiple_of=64,
+#             weight_mode="fused",
+#             chunk_size=64
+#     ):
+#         super().__init__()
+#         assert dim % qkv_block_size == 0
+#         self.dim = dim
+#         self.direction = direction
+#         self.expansion = expansion
+#         self.qkv_block_size = qkv_block_size
+#         self.gate_soft_cap = gate_soft_cap
+#         self.weight_mode = weight_mode
+#         self.num_blocks = num_blocks
+
+#         inner_dim = expansion * dim
+#         num_heads = inner_dim // qkv_block_size
+#         self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
+#         self.qkv_proj = nn.Linear(inner_dim, 3 * inner_dim, bias=proj_bias)
+        
+#         self.q_proj = LinearHeadwiseExpand(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             bias=proj_bias,
+#         )
+#         self.k_proj = LinearHeadwiseExpand(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             bias=proj_bias,
+#         )
+#         self.v_proj = LinearHeadwiseExpand(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             bias=proj_bias,
+#         )
+
+#         if conv_kind == "causal1d":
+#             self.conv = CausalConv1d(inner_dim, kernel_size=conv_kernel_size, bias=conv_bias)
+#         elif conv_kind == "2d":
+#             assert conv_kernel_size % 2 == 1
+#             self.conv = SequenceConv2d(
+#                 inner_dim, inner_dim, kernel_size=conv_kernel_size,
+#                 padding=conv_kernel_size // 2, groups=inner_dim,
+#                 bias=conv_bias, seqlens=seqlens
+#             )
+#         else:
+#             raise NotImplementedError
+
+#         self.mlstm_cell = MatrixLSTMCell(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             norm_bias=norm_bias,
+#             eps=1e-5,
+#             chunk_size=chunk_size
+#         )
+
+#         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
+#         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
+
+#         self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+
+#         self.ffn = FeedForward(
+#             embedding_dim=dim,
+#             ffn_proj_factor=ffn_proj_factor,
+#             ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+#             use_bias=proj_bias,
+#             weight_mode=weight_mode,
+#             num_blocks=num_blocks or 1,
+#         )
+
+#         self.reset_parameters()
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         residual = x
+#         x = self.norm(x)
+
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             x = x.flip(dims=[1])
+
+#         x_inner = self.proj_up(x)
+#         x_mlstm, z = torch.chunk(x_inner, 2, dim=-1)
+
+#         x_mlstm_conv_act = F.silu(self.conv(x_mlstm))
+
+#         # Separate projections adhering to original logic
+#         q = self.q_proj(x_mlstm_conv_act)  # Q from activated input
+#         k = self.k_proj(x_mlstm_conv_act)  # K from activated input
+#         v = self.v_proj(x_mlstm)           # V from raw input
+
+#         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+#         h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_mlstm_conv_act)
+
+#         h_state = h_tilde_state_skip * F.silu(z)
+
+#         x = self.proj_down(h_state)
+
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             x = x.flip(dims=[1])
+
+#         x = residual + x
+
+#         # FFN with residual
+#         ffn_residual = x
+#         x_ffn = self.ffn_norm(x)
+#         x_ffn = self.ffn(x_ffn)
+#         x = ffn_residual + x_ffn
+
+#         return x
+
+#     def reset_parameters(self):
+#         small_init_(self.proj_up.weight, self.dim)
+#         if self.proj_up.bias is not None:
+#             nn.init.zeros_(self.proj_up.bias)
+
+#         small_init_(self.qkv_proj.weight, self.dim)
+#         if self.qkv_proj.bias is not None:
+#             nn.init.zeros_(self.qkv_proj.bias)
+
+#         wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
+#         if self.proj_down.bias is not None:
+#             nn.init.zeros_(self.proj_down.bias)
+
+#         nn.init.ones_(self.learnable_skip)
+#         self.mlstm_cell.reset_parameters()
+#         self.norm.reset_parameters()
+#         self.ffn_norm.reset_parameters()
+#         self.ffn.reset_parameters()
+
+
 #gpt 4.5
 class ViLLayer(nn.Module):
     def __init__(self,
@@ -228,7 +397,7 @@ class ViLLayer(nn.Module):
             conv_kind="2d",
             init_weights="original-fixed",
             seqlens=None,
-            num_blocks=12,
+            num_blocks=15,
             gate_soft_cap=15.0,
             ffn_proj_factor=2.6667,
             ffn_round_up_to_multiple_of=64,
@@ -236,6 +405,7 @@ class ViLLayer(nn.Module):
             chunk_size=64
     ):
         super().__init__()
+        #print(chunk_size)
         assert dim % qkv_block_size == 0
         self.dim = dim
         self.direction = direction
@@ -282,7 +452,8 @@ class ViLLayer(nn.Module):
             dim=inner_dim,
             num_heads=num_heads,
             norm_bias=norm_bias,
-            eps=1e-5
+            eps=1e-5,
+            chunk_size=chunk_size
         )
 
         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
@@ -333,11 +504,11 @@ class ViLLayer(nn.Module):
 
         x = residual + x
 
-        # FFN with residual
-        ffn_residual = x
-        x_ffn = self.ffn_norm(x)
-        x_ffn = self.ffn(x_ffn)
-        x = ffn_residual + x_ffn
+        # # FFN with residual
+        # ffn_residual = x
+        # x_ffn = self.ffn_norm(x)
+        # x_ffn = self.ffn(x_ffn)
+        # x = ffn_residual + x_ffn
 
         return x
 
@@ -367,7 +538,7 @@ class ViLBlock(nn.Module):
     def __init__(self,
         dim,
         direction,
-        drop_path=0.2,
+        drop_path=0.0,
         conv_kind="2d",
         conv_kernel_size=3,
         proj_bias=True,
@@ -385,11 +556,11 @@ class ViLBlock(nn.Module):
         self.drop_path = drop_path
         self.norm_bias = norm_bias
 
-        self.drop_path = DropPath(drop_prob=drop_path)
+        self.drop_path = DropPath(drop_prob=0.0)
         self.norm = nn.RMSNorm(dim, eps=1e-3)
         self.layer = ViLLayer(dim,
                                 direction,
-                                qkv_block_size=16,
+                                qkv_block_size=qkv_block_size,
                                 proj_bias=True,
                                 norm_bias=True,
                                 conv_bias=True,
@@ -398,18 +569,19 @@ class ViLBlock(nn.Module):
                                 init_weights="original",
                                 seqlens=None,  # Initial seqlens, can be overridden in forward
                                 num_blocks=None,
-                                chunk_size=64,
+                                chunk_size=chunk_size,
                             )
 
         self.reset_parameters()
 
     def _forward_path(self, x):
-        x = self.norm(x)
+        #x = self.norm(x)
         x = self.layer(x)
         return x
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.drop_path(x, self._forward_path)
+        # x = self.drop_path(x, self._forward_path)
+        x = self.layer(x)
         return x
 
     def reset_parameters(self):
@@ -481,7 +653,7 @@ class ViLBlock(nn.Module):
 #grok backendsclass 
 from mlstm_kernels.torch.chunkwise.triton_xl_chunk import mlstm_chunkwise__xl_chunk
 class MatrixLSTMCell(nn.Module):
-        def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float32):
+        def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float16):
             super().__init__()
             self.dim = dim
             self.num_heads = num_heads
@@ -492,22 +664,22 @@ class MatrixLSTMCell(nn.Module):
             self.fgate = nn.Linear(3 * dim, num_heads)
             self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-3)
             self.causal_mask_cache = {}
-            chunk_size = 64
+            chunk_size = chunk_size
 
 
 
-            # CPU-compatible backend configuration (remains float32)
+            # CPU-compatible backend configuration (remains float16)
             self.cpu_backend_config_infer = mLSTMBackendConfig(
                 chunkwise_kernel="chunkwise--native_autograd",
                 sequence_kernel="native_sequence__native",
                 step_kernel="native",
                 chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float32",
-                return_last_states=True,
+                autocast_kernel_dtype="float16",
+                return_last_states=False,
                 mode="inference",
-                eps=1e-5
+                eps=5e-5
             )
-            self.cpu_backend = mLSTMBackend(
+            self.cpu_backend_infer = mLSTMBackend(
                 config=self.cpu_backend_config_infer,
             )
 
@@ -517,26 +689,26 @@ class MatrixLSTMCell(nn.Module):
                 sequence_kernel="native_sequence__triton",
                 step_kernel="triton",
                 chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
-                return_last_states=True,
+                autocast_kernel_dtype="float16",  # Autocast in forward pass can override this
+                return_last_states=False,
                 mode="inference",
-                eps=1e-5
+                eps=5e-5
             )
-            self.gpu_backend = mLSTMBackend(
+            self.gpu_backend_infer = mLSTMBackend(
                 config=self.gpu_backend_config_infer,
             )
 
 
-            # CPU-compatible backend configuration (remains float32)
+            # CPU-compatible backend configuration (remains float16)
             self.cpu_backend_config = mLSTMBackendConfig(
                 chunkwise_kernel="chunkwise--native_autograd",
                 sequence_kernel="native_sequence__native",
                 step_kernel="native",
                 chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float32",
+                autocast_kernel_dtype="float16",
                 return_last_states=False,
                 mode="train",
-                eps=1e-5
+                eps=5e-5
             )
             self.cpu_backend = mLSTMBackend(
                 config=self.cpu_backend_config,
@@ -548,10 +720,10 @@ class MatrixLSTMCell(nn.Module):
                 sequence_kernel="native_sequence__triton",
                 step_kernel="triton",
                 chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
+                autocast_kernel_dtype="float16",  # Autocast in forward pass can override this
                 return_last_states=False,
                 mode="train",
-                eps=1e-5
+                eps=5e-5
             )
             self.gpu_backend = mLSTMBackend(
                 config=self.gpu_backend_config,
@@ -570,6 +742,7 @@ class MatrixLSTMCell(nn.Module):
             if not (q.device == k.device == v.device):
                 raise ValueError("All input tensors (q, k, v) must be on the same device.")
             backend = self.gpu_backend if device.type == 'cuda' else self.cpu_backend
+            backend_infer = self.gpu_backend_infer if device.type == 'cuda' else self.cpu_backend
 
             # Prepare gate inputs
             if_gate_input = torch.cat([q, k, v], dim=-1)
@@ -582,12 +755,12 @@ class MatrixLSTMCell(nn.Module):
             v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
 
             # Compute h_state with the selected backend, applying autocast if specified
-            if device.type == 'cuda' and self.use_autocast and self.train:
-                q = q.to(self.autocast_dtype).contiguous()
-                k = k.to(self.autocast_dtype).contiguous()
-                v = v.to(self.autocast_dtype).contiguous()
-                i = i.to(self.autocast_dtype).contiguous()
-                f = f.to(self.autocast_dtype).contiguous()
+            if device.type == 'cuda' and self.use_autocast and self.training:
+                q = q.to(self.autocast_dtype)
+                k = k.to(self.autocast_dtype)
+                v = v.to(self.autocast_dtype)
+                i = i.to(self.autocast_dtype)
+                f = f.to(self.autocast_dtype)
                 # print("Autocast type" + str(q.dtype))
                 h_state = backend(
                     q=q,
@@ -596,7 +769,7 @@ class MatrixLSTMCell(nn.Module):
                     i=i,
                     f=f,
                 )  
-            elif device.type == 'cpu' and self.train:
+            elif device.type == 'cpu' and self.training:
                 h_state = backend(
                     q=q,
                     k=k,
@@ -606,12 +779,12 @@ class MatrixLSTMCell(nn.Module):
                 )  # (B, NH, S, DH)
                         # Compute h_state with the selected backend, applying autocast if specified
             if device.type == 'cuda' and self.use_autocast and not self.training:
-                q = q.to(self.autocast_dtype).contiguous()
-                k = k.to(self.autocast_dtype).contiguous()
-                v = v.to(self.autocast_dtype).contiguous()
-                i = i.to(self.autocast_dtype).contiguous()
-                f = f.to(self.autocast_dtype).contiguous()
-                h_state = backend(
+                q = q.to(self.autocast_dtype)
+                k = k.to(self.autocast_dtype)
+                v = v.to(self.autocast_dtype)
+                i = i.to(self.autocast_dtype)
+                f = f.to(self.autocast_dtype)
+                h_state = backend_infer(
                     q=q,
                     k=k,
                     v=v,
@@ -619,7 +792,7 @@ class MatrixLSTMCell(nn.Module):
                     f=f,
                 )  # (B, NH, S, DH)
             elif device.type == 'cpu' and not self.training:
-                h_state = backend(
+                h_state = backend_infer(
                     q=q,
                     k=k,
                     v=v,
@@ -642,7 +815,8 @@ class MatrixLSTMCell(nn.Module):
             bias_linspace_init_(self.fgate.bias, start=3.0, end=6.0)
             # Input gate initialization
             torch.nn.init.zeros_(self.igate.weight)
-            torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
+            torch.nn.init.constant_(self.igate.bias, -10)
+            #torch.nn.init.normal_(self.igate.bias, mean=-10, std=0.1)
 
 
 
@@ -895,7 +1069,7 @@ class ViLBlockPair(nn.Module):
         proj_bias=True,
         norm_bias=True,
         seqlens=None,
-        num_blocks=None,
+        num_blocks=15,
         init_weights="original",
         chunk_size=256,
         qkv_block_size = 4
@@ -913,7 +1087,7 @@ class ViLBlockPair(nn.Module):
             num_blocks=num_blocks,
             init_weights=init_weights,
             chunk_size=chunk_size,
-            qkv_block_size = 4
+            qkv_block_size = qkv_block_size
         )
         self.rowwise_from_bot_right = ViLBlock(
             dim=dim,
@@ -927,13 +1101,13 @@ class ViLBlockPair(nn.Module):
             num_blocks=num_blocks,
             init_weights=init_weights,
             chunk_size=chunk_size,
-            qkv_block_size = 4
+            qkv_block_size = qkv_block_size
         )
 
     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:
         out1 = self.rowwise_from_top_left(x)
-        out2 = self.rowwise_from_bot_right(out1)
-        return out2
+        #out2 = self.rowwise_from_bot_right(out1)
+        return out1
 
 
 class VisionLSTM2(nn.Module):

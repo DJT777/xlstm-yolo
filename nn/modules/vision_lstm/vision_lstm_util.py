@@ -224,9 +224,12 @@ class VitPosEmbed(nn.Module):
         self.interpolate_offset = interpolate_offset
         if is_learnable:
             self.embed = nn.Parameter(torch.zeros(1, *seqlens, dim))
+            print(is_learnable)
         else:
             self.register_buffer("embed", get_sincos_pos_embed_from_seqlens(seqlens=seqlens, dim=dim).unsqueeze(0))
         self.reset_parameters()
+
+        print
 
     @property
     def _expected_x_ndim(self):

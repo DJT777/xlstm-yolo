@@ -6,6 +6,7 @@ import re
 import types
 from copy import deepcopy
 from pathlib import Path
+import math
 
 import torch
 
@@ -73,10 +74,12 @@ from ultralytics.nn.modules import (
     SequenceConv2dBlock,
     PatchMergeBlock,
     VisionClueMerge,
-    XViLBlockPairBlock,
     ViLFusionBlock,
     ViLLayerNormBlock,
-    PatchMerger
+    PatchMerger,
+    PermuteBlock,
+    FlattenPosEmbedBlock,
+    PatchMerging
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -146,7 +149,7 @@ class BaseModel(torch.nn.Module):
             return self._predict_augment(x)
         return self._predict_once(x, profile, visualize, embed)
 
-    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    def _predict_once(self, x, profile=True, visualize=False, embed=None):
         """
         Perform a forward pass through the network.
 
@@ -159,6 +162,7 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
+        profile = True
         y, dt, embeddings = [], [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -346,7 +350,7 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 640 # 2x min stride
+            s = 512 # 2x min stride
             m.inplace = self.inplace
 
             def _forward(x):
@@ -1076,7 +1080,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
     if scales:
         scale = d.get("scale")
         if not scale:
-            scale = tuple(scales.keys())[0]
+            scale = tuple(scales.keys())[1]
             LOGGER.warning(f"WARNING ⚠️ no model scale passed. Assuming scale='{scale}'.")
         depth, width, max_channels = scales[scale]
 
@@ -1198,17 +1202,16 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is PatchMergeBlock:
             c1 = ch[f]
             c2 = args[3]  # out_dim from args, e.g., 512 or 1024
+        elif m is PatchMerging: # <<< MODIFIED/ADDED BLOCK
+            c1 = ch[f]
+            c2 = 2 * c1  # SWIN doubles the input dimension
+            args = [c1]  # PatchMerging __init__ takes c1 (as in_dim)
         # elif m is ViLPairBlockWrapper:
         #     c1 = ch[f]
         #     c2 = args[0]  # dim from args, e.g., 256, 512, or 1024
         elif m in {ViLBlockPairBlock, ViLFusionBlock}:
             c1 = ch[f]            
             c2 = args[1]  # c2 from args3
-        elif m in {XViLBlockPairBlock}:
-            c1 = args[0]
-            c2 = args[1]
-            # print("C1 " + str(c1))
-            # print("C2 " + str(c2))
         elif m is VisionClueMerge:
             c1 = ch[f]
             c2 = args[1]  # c2 from args

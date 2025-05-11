@@ -7,6 +7,8 @@ import torch.nn.functional as F
 
 from ultralytics.utils.torch_utils import fuse_conv_and_bn
 
+import math
+
 from .conv import Conv, DWConv, GhostConv, LightConv, RepConv, autopad
 from .transformer import TransformerBlock
 from .vision_lstm.vision_lstm2 import VitPatchEmbed, VitPosEmbed2d, ViLBlockPair, SequenceConv2d, LayerNorm, MultiHeadLayerNorm, MultiHeadRMSNorm
@@ -64,10 +66,12 @@ __all__ = (
     "VitPosEmbed2dBlock",
     "ViLBlockPairBlock",
     "PatchMergeBlock",
-    "XViLBlockPairBlock"
     "ViLFusionBlock"
     "ViLLayerNormBlock",
-    "PatchMerger"
+    "PatchMerger",
+    "PermuteBlock",
+    "FlattenPosEmbedBlock",
+    "PatchMerging"
 )
 
 
@@ -1699,8 +1703,68 @@ class VitPosEmbedBlock(nn.Module):
         return self.module(x)  # Adds positional embeddings, preserving input shape
   
 
-import torch
-import torch.nn as nn
+
+class FlattenPosEmbedBlock(nn.Module):
+    """
+    A wrapper for VitPosEmbedBlock that re-embeds flattened sequences by reshaping them to their
+    original grid shape, applying positional embeddings, and flattening them back.
+
+    Args:
+        *args: Variable length argument list, typically [c1, c2, seqlens].
+            - c1 (int): Input dimension (must equal c2).
+            - c2 (int): Embedding dimension.
+            - seqlens (list/tuple): Sequence lengths, e.g., [H, W] for 2D or [T, H, W] for 3D.
+        **kwargs: Additional arguments passed to VitPosEmbedBlock (e.g., is_learnable, allow_interpolation).
+
+    Input:
+        x (torch.Tensor): Flattened patch embeddings of shape [B, L, D], where L = H*W (2D) or T*H*W (3D).
+
+    Output:
+        torch.Tensor: Flattened embeddings with positional embeddings added, shape [B, L, D].
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        # Parse args similar to VitPosEmbedBlock for YAML compatibility
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            args = args[0]
+        c1, c2, seqlens = args
+        assert c1 == c2, "Input and output dimensions must be equal"
+        self.seqlens = seqlens
+        self.module = VitPosEmbedBlock(*args, **kwargs)
+
+    def forward(self, x):
+        # Reshape flattened input [B, L, D] to grid shape based on seqlens
+        if len(self.seqlens) == 2:  # 2D case: [B, H*W, D] -> [B, H, W, D]
+            H, W = self.seqlens
+            x = x.view(-1, H, W, x.shape[-1])
+        elif len(self.seqlens) == 3:  # 3D case: [B, T*H*W, D] -> [B, T, H, W, D]
+            T, H, W = self.seqlens
+            x = x.view(-1, T, H, W, x.shape[-1])
+        else:
+            raise ValueError("seqlens must be length 2 or 3")
+        
+        # Apply positional embeddings using VitPosEmbedBlock
+        x = self.module(x)
+        
+        # Flatten back to [B, L, D]
+        x = x.view(x.shape[0], -1, x.shape[-1])
+        return x
+    
+class PermuteBlock(nn.Module):
+    """
+    Reshape from [B, S, D] to [B, H, W, D] for 2D sequences, where S = H*W.
+    """
+    def __init__(self, seqlens):
+        super().__init__()
+        assert len(seqlens) == 2, "seqlens must be a list/tuple of length 2 for 2D"
+        self.seqlens = seqlens
+
+    def forward(self, x):
+        B, S, D = x.shape
+        H, W = self.seqlens
+        expected_S = H * W
+        assert S == expected_S, f"Expected sequence length {expected_S}, got {S}"
+        return einops.rearrange(x, "b (h w) d -> b h w d", h=H, w=W)
 
 class ViLBlockPairBlock(nn.Module):
     """
@@ -1745,17 +1809,18 @@ class ViLBlockPairBlock(nn.Module):
             raise ValueError("seqlens must be a list/tuple of length 2 (2D) or 3 (3D)")
 
         # print(seqlens)
-        # print(config.get("chunk_size", 256))
+        #print(config.get("chunk_size", 256))
         # Initialize the underlying ViLBlockPair without hidden state management
+        #print("BLOCK SIZE " + str(config.get("qkv_block_size", 16)))
         self.module = ViLBlockPair(
             dim=c2,
-            drop_path=config.get("drop_path", 0.0),
+            drop_path=config.get("drop_path", 0.00),
             conv_kind=config.get("conv_kind", "2d"),
             conv_kernel_size=config.get("conv_kernel_size", 3),
             proj_bias=config.get("proj_bias", True),
             norm_bias=config.get("norm_bias", True),
             seqlens=seqlens,
-            qkv_block_size = config.get("qkv_block_size", 4),
+            qkv_block_size = config.get("qkv_block_size", 16),
             num_blocks=config.get("num_blocks", None),
             init_weights=config.get("init_weights", "original"),
             chunk_size=config.get("chunk_size", 256),
@@ -1975,6 +2040,114 @@ class VisionClueMerge(nn.Module):
 #         return self.pw_linear(y)
     
 
+class PatchMerging(nn.Module):
+    r"""
+    Patch Merging Layer using SWIN Transformer's original internal logic.
+    This layer reduces the number of patches (tokens) by a factor of 4
+    (halving height and width) and doubles the feature dimension.
+
+    The constructor expects 'c1' (input channels/feature dimension), which is
+    automatically provided by the Ultralytics `parse_model` function.
+
+    Args:
+        c1 (int): Number of input channels (feature dimension for each patch).
+                  This is referred to as `in_dim` internally.
+        norm_layer (nn.Module, optional): Normalization layer.
+                                          Default: nn.LayerNorm.
+    """
+
+    def __init__(self, c1: int, norm_layer=nn.RMSNorm):
+        super().__init__()
+        self.in_dim = c1  # c1 from parse_model is the input dimension
+
+        # Original SWIN logic: projects 4*in_dim to 2*in_dim
+        self.reduction = nn.Linear(4 * self.in_dim, 2 * self.in_dim, bias=False)
+        self.norm = norm_layer(2 * self.in_dim, eps=1e-4)
+
+    def forward(self, x: torch.Tensor, input_resolution: tuple[int, int] = None) -> torch.Tensor:
+        """
+        Apply SWIN's original patch merging logic.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, L, C),
+                              where L = number of input patches (e.g., H*W),
+                              and C = input feature dimension (must match self.in_dim).
+            input_resolution (tuple[int, int], optional):
+                Spatial resolution (H, W) of the input feature map *before*
+                it was flattened into L patches. If None, H and W will be inferred
+                by assuming L is a perfect square (H=W=sqrt(L)).
+                For SWIN's 2x2 merging, H and W must be even.
+
+        Returns:
+            torch.Tensor: Output tensor of shape (B, L/4, 2*C).
+                          The feature dimension is doubled.
+        """
+        B, L, C = x.shape
+        assert C == self.in_dim, \
+            f"Input channel C ({C}) does not match PatchMerging module's in_dim ({self.in_dim})."
+
+        H, W = -1, -1
+        if input_resolution is not None:
+            H, W = input_resolution
+            if L != H * W: # Ensure L is consistent with provided H, W
+                 assert L == H * W, \
+                    f"Input feature length L ({L}) does not match H*W ({H*W}) from input_resolution."
+        else:
+            # Attempt to infer H, W assuming square input if not provided
+            if not math.isqrt(L)**2 == L:
+                raise ValueError(
+                    f"Input feature length L ({L}) is not a perfect square. "
+                    "Please provide input_resolution for non-square inputs or if H, W are explicit."
+                )
+            H = W = math.isqrt(L)
+
+        assert H % 2 == 0 and W % 2 == 0, \
+            f"Resolved input H ({H}) and W ({W}) must be even for 2x2 patch merging."
+
+        x_reshaped = x.view(B, H, W, C)
+
+        # Partition into 2x2 patches
+        x0 = x_reshaped[:, 0::2, 0::2, :]  # B H/2 W/2 C
+        x1 = x_reshaped[:, 1::2, 0::2, :]  # B H/2 W/2 C
+        x2 = x_reshaped[:, 0::2, 1::2, :]  # B H/2 W/2 C
+        x3 = x_reshaped[:, 1::2, 1::2, :]  # B H/2 W/2 C
+
+        # Concatenate along the channel dimension
+        merged_x = torch.cat([x0, x1, x2, x3], -1)  # B H/2 W/2 4*C
+        # Flatten spatial dimensions
+        merged_x = merged_x.view(B, -1, 4 * C)      # B (L/4) (4*C)
+
+        # Apply linear reduction (to 2*C) and normalization
+        output_x = self.reduction(merged_x)         # B (L/4) (2*C)
+        output_x = self.norm(output_x)              # B (L/4) (2*C)
+
+        return output_x
+
+    def extra_repr(self) -> str:
+        return (f"in_dim={self.in_dim}, output_feature_dim=2*{self.in_dim}, "
+                f"patch_reduction_factor=4x")
+
+    def flops(self, H_in: int = None, W_in: int = None, L_in: int = None) -> int:
+        """
+        Calculate FLOPs for this layer.
+        Requires either (H_in, W_in) or L_in (from which H_in, W_in can be inferred if square).
+        """
+        if H_in is None or W_in is None:
+            if L_in is None:
+                raise ValueError("Must provide (H_in, W_in) or L_in to calculate FLOPs.")
+            if not math.isqrt(L_in)**2 == L_in:
+                raise ValueError(
+                    f"L_in ({L_in}) is not a perfect square. Cannot infer H_in, W_in for FLOPs. "
+                    "Please provide H_in and W_in directly."
+                )
+            H_in = W_in = math.isqrt(L_in)
+
+        if not (H_in > 0 and W_in > 0):
+            return 0
+
+        flops_reduction = (H_in // 2) * (W_in // 2) * (4 * self.in_dim) * (2 * self.in_dim)
+        flops_norm_approx = (H_in * W_in * self.in_dim) // 2
+        return flops_reduction + flops_norm_approx
 
 class PatchMerger(nn.Module):
     def __init__(self, in_dim, out_dim):
@@ -1988,113 +2161,7 @@ class PatchMerger(nn.Module):
         y = torch.einsum('bmn,bnd->bmd', attention, x)  # (B, M, D)
         return y
     
-class XViLBlockPairBlock(nn.Module):
-    """
-    An adapted block for VisionLSTM that processes concatenated feature maps for object detection.
-    Scales down input channels before processing with ViLBlockPair, returning output in 4D format.
-
-    Args:
-        c1 (int): Input channel dimension (e.g., 1536 from concatenation).
-        c2 (int): Output channel dimension (e.g., 512).
-        config (dict): Configuration dictionary with keys like 'seqlens', 'chunk_size', etc.
-    """
-    def __init__(self, *args, **kwargs):
-        super().__init__()
-        # print("XVIL ARGS")
-        # print(args)
-        # Handle args from YAML parsing
-        if len(args) == 1 and isinstance(args[0], (list, tuple)):
-            args = args[0]
-
-        
-        c1, c2, config = args if len(args) > 2 else (args[0], args[1], {})
-
-        self.c1 = c1  # Input channels (e.g., concatenated channels)
-        self.c2 = c2  # Output channels (dim)
-        self.config = config
-
-        # print("INNER C1 " + str(c1))
-        # print("INNER C2 " + str(c2))
-
-        # Extract sequence lengths (e.g., [H, W] for 2D or [T, H, W] for 3D)
-        seqlens = config.get("seqlens")
-        if not seqlens:
-            raise ValueError("seqlens is required in config for XViLBlockPairBlock")
-        if not isinstance(seqlens, (list, tuple)):
-            raise ValueError("seqlens must be a list or tuple")
-
-        # Determine mode and compute expected sequence length
-        if len(seqlens) == 2:
-            self.mode = "2d"
-            self.expected_seq = seqlens[0] * seqlens[1]  # H * W
-        elif len(seqlens) == 3:
-            self.mode = "3d"
-            self.expected_seq = seqlens[0] * seqlens[1] * seqlens[2]  # T * H * W
-            if config.get("conv_kind", "2d") != "3d":
-                config["conv_kind"] = "3d"
-        else:
-            raise ValueError("seqlens must be a list/tuple of length 2 (2D) or 3 (3D)")
-
-        # Input projection to scale down channels (like XSSBlock's in_proj)
-        if c1 != c2:
-            self.in_proj = nn.Sequential(
-                nn.Conv2d(c1, c2, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.BatchNorm2d(c2),
-                nn.SiLU()
-            )
-        else:
-            self.in_proj = nn.Identity()
-
-        # Underlying ViLBlockPair
-        self.module = ViLBlockPair(
-            dim=c2,
-            drop_path=config.get("drop_path", 0.0),
-            conv_kind=config.get("conv_kind", "2d"),
-            conv_kernel_size=config.get("conv_kernel_size", 3),
-            proj_bias=config.get("proj_bias", True),
-            norm_bias=config.get("norm_bias", True),
-            seqlens=seqlens,
-            num_blocks=config.get("num_blocks", None),
-            init_weights=config.get("init_weights", "original"),
-            chunk_size=config.get("chunk_size", 256),
-        )
-        self.seqlens = seqlens  # Store for reference
-
-    def forward(self, x):
-        """
-        Forward pass of the block, processing 4D input and returning 4D output tensor.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C_in, H, W).
-
-        Returns:
-            torch.Tensor: Output tensor of shape (B, c2, H, W).
-        """
-        if not isinstance(x, torch.Tensor):
-            raise ValueError(f"Expected x to be a torch.Tensor, got {type(x)}")
-
-        # Input shape: (B, C_in, H, W)
-        B, C_in, H, W = x.shape
-        assert C_in == self.c1, f"Input channels {C_in} must match c1 {self.c1}"
-
-        # Scale down channels
-        x = self.in_proj(x)  # (B, c2, H, W)
-
-        # Flatten to sequence
-        S = H * W if self.mode == "2d" else H * W * self.seqlens[0]
-        x_seq = x.view(B, self.c2, -1).permute(0, 2, 1)  # (B, S, c2)
-        assert x_seq.shape[1] == self.expected_seq, (
-            f"Sequence length {x_seq.shape[1]} does not match expected {self.expected_seq}"
-        )
-
-        # Process with ViLBlockPair
-        out_seq = self.module(x_seq)  # (B, S, c2)
-
-        # Reshape back to 4D
-        out = out_seq.permute(0, 2, 1).view(B, self.c2, H, W)  # (B, c2, H, W)
-        return out
     
-
 
 class RGBlock(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,
@@ -2191,6 +2258,7 @@ class ViLFusionBlock(nn.Module):
         # print(config)
         # Extract seqlens from config
         seqlens = config.get("seqlens")
+        mlp_ratio = config.get("mlp_ratio")
         if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
             raise ValueError("config['seqlens'] must be a list/tuple of length 2 or 3")
 
@@ -2210,7 +2278,7 @@ class ViLFusionBlock(nn.Module):
         self.lsblock = LSBlock(hidden_dim, hidden_dim)
 
         # Normalization for sequence input (B, S, D)
-        self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+        self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
 
         # ViLBlockPairBlock replacing SS2D
         self.vil = nn.Sequential(*[
@@ -2224,6 +2292,7 @@ class ViLFusionBlock(nn.Module):
         # Optional MLP branch (same as XSSBlock)
         self.mlp_branch = mlp_ratio > 0
         if self.mlp_branch:
+            #print("MLP EXISTS!")
             self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)  # Sequence norm
             mlp_hidden_dim = int(hidden_dim * mlp_ratio)
             self.mlp = RGBlock(
@@ -2254,8 +2323,8 @@ class ViLFusionBlock(nn.Module):
         seq = einops.rearrange(x_local, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
 
         # Normalize and process with ViLBlockPairBlock
-        seq_norm = self.norm(seq)  # (B, S, hidden_dim)
-        seq_out = self.vil(seq_norm)  # (B, S, hidden_dim)
+        #seq_norm = self.norm(seq)  # (B, S, hidden_dim)
+        seq_out = self.vil(seq)  # (B, S, hidden_dim)
 
         # Apply drop path and residual connection in sequence space
         seq = seq + self.drop_path(seq_out)  # (B, S, hidden_dim)

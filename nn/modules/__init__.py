@@ -68,10 +68,12 @@ from .block import (
     SequenceConv2dBlock,
     PatchMergeBlock,
     VisionClueMerge,
-    XViLBlockPairBlock,
     ViLFusionBlock,
     ViLLayerNormBlock,
-    PatchMerger
+    PatchMerger,
+    FlattenPosEmbedBlock,
+    PermuteBlock,
+    PatchMerging
 )
 from .conv import (
     CBAM,
