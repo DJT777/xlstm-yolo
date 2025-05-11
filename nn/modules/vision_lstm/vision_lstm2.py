@@ -484,7 +484,7 @@ class ViLBlock(nn.Module):
 #grok backendsclass 
 from mlstm_kernels.torch.chunkwise.triton_xl_chunk import mlstm_chunkwise__xl_chunk
 class MatrixLSTMCell(nn.Module):
-        def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float32):
+        def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float16):
             super().__init__()
             self.dim = dim
             self.num_heads = num_heads
@@ -499,18 +499,18 @@ class MatrixLSTMCell(nn.Module):
 
 
 
-            # CPU-compatible backend configuration (remains float32)
+            # CPU-compatible backend configuration (remains float16)
             self.cpu_backend_config_infer = mLSTMBackendConfig(
                 chunkwise_kernel="chunkwise--native_autograd",
                 sequence_kernel="native_sequence__native",
                 step_kernel="native",
                 chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float32",
-                return_last_states=True,
+                autocast_kernel_dtype="float16",
+                return_last_states=False,
                 mode="inference",
                 eps=5e-5
             )
-            self.cpu_backend = mLSTMBackend(
+            self.cpu_backend_infer = mLSTMBackend(
                 config=self.cpu_backend_config_infer,
             )
 
@@ -520,23 +520,23 @@ class MatrixLSTMCell(nn.Module):
                 sequence_kernel="native_sequence__triton",
                 step_kernel="triton",
                 chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
-                return_last_states=True,
+                autocast_kernel_dtype="float16",  # Autocast in forward pass can override this
+                return_last_states=False,
                 mode="inference",
                 eps=5e-5
             )
-            self.gpu_backend = mLSTMBackend(
+            self.gpu_backend_infer = mLSTMBackend(
                 config=self.gpu_backend_config_infer,
             )
 
 
-            # CPU-compatible backend configuration (remains float32)
+            # CPU-compatible backend configuration (remains float16)
             self.cpu_backend_config = mLSTMBackendConfig(
                 chunkwise_kernel="chunkwise--native_autograd",
                 sequence_kernel="native_sequence__native",
                 step_kernel="native",
                 chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float32",
+                autocast_kernel_dtype="float16",
                 return_last_states=False,
                 mode="train",
                 eps=5e-5
@@ -551,7 +551,7 @@ class MatrixLSTMCell(nn.Module):
                 sequence_kernel="native_sequence__triton",
                 step_kernel="triton",
                 chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float32",  # Autocast in forward pass can override this
+                autocast_kernel_dtype="float16",  # Autocast in forward pass can override this
                 return_last_states=False,
                 mode="train",
                 eps=5e-5
@@ -585,12 +585,12 @@ class MatrixLSTMCell(nn.Module):
             v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
 
             # Compute h_state with the selected backend, applying autocast if specified
-            if device.type == 'cuda' and self.use_autocast and self.train:
-                q = q.to(self.autocast_dtype).contiguous()
-                k = k.to(self.autocast_dtype).contiguous()
-                v = v.to(self.autocast_dtype).contiguous()
-                i = i.to(self.autocast_dtype).contiguous()
-                f = f.to(self.autocast_dtype).contiguous()
+            if device.type == 'cuda' and self.use_autocast and self.training:
+                q = q.to(self.autocast_dtype)
+                k = k.to(self.autocast_dtype)
+                v = v.to(self.autocast_dtype)
+                i = i.to(self.autocast_dtype)
+                f = f.to(self.autocast_dtype)
                 # print("Autocast type" + str(q.dtype))
                 h_state = backend(
                     q=q,
@@ -599,7 +599,7 @@ class MatrixLSTMCell(nn.Module):
                     i=i,
                     f=f,
                 )  
-            elif device.type == 'cpu' and self.train:
+            elif device.type == 'cpu' and self.training:
                 h_state = backend(
                     q=q,
                     k=k,
@@ -609,11 +609,11 @@ class MatrixLSTMCell(nn.Module):
                 )  # (B, NH, S, DH)
                         # Compute h_state with the selected backend, applying autocast if specified
             if device.type == 'cuda' and self.use_autocast and not self.training:
-                q = q.to(self.autocast_dtype).contiguous()
-                k = k.to(self.autocast_dtype).contiguous()
-                v = v.to(self.autocast_dtype).contiguous()
-                i = i.to(self.autocast_dtype).contiguous()
-                f = f.to(self.autocast_dtype).contiguous()
+                q = q.to(self.autocast_dtype)
+                k = k.to(self.autocast_dtype)
+                v = v.to(self.autocast_dtype)
+                i = i.to(self.autocast_dtype)
+                f = f.to(self.autocast_dtype)
                 h_state = backend(
                     q=q,
                     k=k,
@@ -936,8 +936,8 @@ class ViLBlockPair(nn.Module):
 
     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:
         out1 = self.rowwise_from_top_left(x)
-        out2 = self.rowwise_from_bot_right(out1)
-        return out2
+        #out2 = self.rowwise_from_bot_right(out1)
+        return out1
 
 
 class VisionLSTM2(nn.Module):

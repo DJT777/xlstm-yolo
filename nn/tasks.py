@@ -6,6 +6,7 @@ import re
 import types
 from copy import deepcopy
 from pathlib import Path
+import math
 
 import torch
 
@@ -75,7 +76,10 @@ from ultralytics.nn.modules import (
     VisionClueMerge,
     ViLFusionBlock,
     ViLLayerNormBlock,
-    PatchMerger
+    PatchMerger,
+    PermuteBlock,
+    FlattenPosEmbedBlock,
+    PatchMerging
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -145,7 +149,7 @@ class BaseModel(torch.nn.Module):
             return self._predict_augment(x)
         return self._predict_once(x, profile, visualize, embed)
 
-    def _predict_once(self, x, profile=False, visualize=False, embed=None):
+    def _predict_once(self, x, profile=True, visualize=False, embed=None):
         """
         Perform a forward pass through the network.
 
@@ -158,6 +162,7 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.Tensor): The last output of the model.
         """
+        #profile = True
         y, dt, embeddings = [], [], []  # outputs
         for m in self.model:
             if m.f != -1:  # if not from previous layer
@@ -1197,6 +1202,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is PatchMergeBlock:
             c1 = ch[f]
             c2 = args[3]  # out_dim from args, e.g., 512 or 1024
+        elif m is PatchMerging: # <<< MODIFIED/ADDED BLOCK
+            c1 = ch[f]
+            c2 = 2 * c1  # SWIN doubles the input dimension
+            args = [c1]  # PatchMerging __init__ takes c1 (as in_dim)
         # elif m is ViLPairBlockWrapper:
         #     c1 = ch[f]
         #     c2 = args[0]  # dim from args, e.g., 256, 512, or 1024
