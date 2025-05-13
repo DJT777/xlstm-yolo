@@ -249,7 +249,7 @@ class ViLLayer(nn.Module):
         inner_dim = expansion * dim
         num_heads = inner_dim // qkv_block_size
         self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
-        self.qkv_proj = nn.Linear(inner_dim, 3 * inner_dim, bias=proj_bias)
+        #self.qkv_proj = nn.Linear(inner_dim, 3 * inner_dim, bias=proj_bias)
         
         self.q_proj = LinearHeadwiseExpand(
             dim=inner_dim,
@@ -291,37 +291,46 @@ class ViLLayer(nn.Module):
         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
 
         self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        # self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
 
-        self.ffn = FeedForward(
-            embedding_dim=dim,
-            ffn_proj_factor=ffn_proj_factor,
-            ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
-            use_bias=proj_bias,
-            weight_mode=weight_mode,
-            num_blocks=num_blocks or 1,
-        )
+        # self.ffn = FeedForward(
+        #     embedding_dim=dim,
+        #     ffn_proj_factor=ffn_proj_factor,
+        #     ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+        #     use_bias=proj_bias,
+        #     weight_mode=weight_mode,
+        #     num_blocks=num_blocks or 1,
+        # )
 
         self.reset_parameters()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of the ViLLayer.
+
+        Args:
+            x: Input tensor of shape [batch, seq_len, dim]
+
+        Returns:
+            Output tensor of shape [batch, seq_len, dim]
+        """
         residual = x
         x = self.norm(x)
 
+        # Flip sequence if processing bottom-right to top-left
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x = x.flip(dims=[1])
 
+        # Project up and split into x_mlstm and gating tensor z
         x_inner = self.proj_up(x)
         x_mlstm, z = torch.chunk(x_inner, 2, dim=-1)
 
+        # Apply convolution and activation for Q and K
         x_mlstm_conv_act = F.silu(self.conv(x_mlstm))
 
-        # fused QKV projections
-        qkv = self.qkv_proj(x_mlstm_conv_act)
-        q, k, v = torch.chunk(qkv, 3, dim=-1)
-        # q = self.q_proj(x_mlstm_conv_act)
-        # k = self.k_proj(x_mlstm_conv_act)
-        # v = self.v_proj(x_mlstm)
+        # Project to Q, K, V
+        q = self.q_proj(x_mlstm_conv_act)  # [batch, seq_len, inner_dim]
+        k = self.k_proj(x_mlstm_conv_act)  # [batch, seq_len, inner_dim]
+        v = self.v_proj(x_mlstm)           # [batch, seq_len, inner_dim]
 
         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
         h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_mlstm_conv_act)
@@ -336,10 +345,10 @@ class ViLLayer(nn.Module):
         x = residual + x
 
         # FFN with residual
-        ffn_residual = x
-        x_ffn = self.ffn_norm(x)
-        x_ffn = self.ffn(x_ffn)
-        x = ffn_residual + x_ffn
+        # ffn_residual = x
+        # x_ffn = self.ffn_norm(x)
+        # x_ffn = self.ffn(x_ffn)
+        # x = ffn_residual + x_ffn
 
         return x
 
@@ -348,9 +357,9 @@ class ViLLayer(nn.Module):
         if self.proj_up.bias is not None:
             nn.init.zeros_(self.proj_up.bias)
 
-        small_init_(self.qkv_proj.weight, self.dim)
-        if self.qkv_proj.bias is not None:
-            nn.init.zeros_(self.qkv_proj.bias)
+        # small_init_(self.qkv_proj.weight, self.dim)
+        # if self.qkv_proj.bias is not None:
+        #     nn.init.zeros_(self.qkv_proj.bias)
 
         wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
         if self.proj_down.bias is not None:
@@ -359,8 +368,8 @@ class ViLLayer(nn.Module):
         nn.init.ones_(self.learnable_skip)
         self.mlstm_cell.reset_parameters()
         self.norm.reset_parameters()
-        self.ffn_norm.reset_parameters()
-        self.ffn.reset_parameters()
+        # self.ffn_norm.reset_parameters()
+        # self.ffn.reset_parameters()
 
 #
 
@@ -936,7 +945,7 @@ class ViLBlockPair(nn.Module):
 
     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:
         out1 = self.rowwise_from_top_left(x)
-        #out2 = self.rowwise_from_bot_right(out1)
+        out2 = self.rowwise_from_bot_right(out1)
         return out1
 
 
@@ -1384,3 +1393,190 @@ def wang_init_(param: torch.Tensor, dim: int, num_blocks: int):
     torch.nn.init.normal_(param, mean=0.0, std=std)
     return param
 
+
+
+
+from torch.profiler import profile, record_function, ProfilerActivity
+# Your ViLLayer class (copied from your prompt)
+class ViLLayerProfiled(nn.Module):
+    def __init__(
+            self,
+            dim,
+            direction,
+            expansion=2,
+            qkv_block_size=4,
+            proj_bias=True,
+            norm_bias=True,
+            conv_bias=True,
+            conv_kernel_size=4,
+            conv_kind="2d",
+            init_weights="original",
+            seqlens=None,
+            num_blocks=None,
+            chunk_size = 256
+    ):
+        super().__init__()
+        assert dim % qkv_block_size == 0
+        self.dim = dim
+        self.direction = direction
+        self.expansion = expansion
+        self.qkv_block_size = qkv_block_size
+        self.proj_bias = proj_bias
+        self.conv_bias = conv_bias
+        self.conv_kernel_size = conv_kernel_size
+        self.conv_kind = conv_kind
+        self.init_weights = init_weights
+        self.num_blocks = num_blocks
+        self.chunk_size = chunk_size
+
+        inner_dim = expansion * dim
+        num_heads = inner_dim // qkv_block_size # This should be inner_dim // head_dim, assuming qkv_block_size is head_dim
+        # If qkv_block_size is the number of blocks for QKV, then num_heads might be interpreted differently.
+        # For now, let's assume qkv_block_size is a dimension for each head.
+        # Let's assume head_dim = qkv_block_size for LinearHeadwiseExpand
+        # And num_heads = inner_dim // qkv_block_size
+
+        self.proj_up = nn.Linear(
+            in_features=dim,
+            out_features=2 * inner_dim,
+            bias=proj_bias,
+        )
+        self.q_proj = LinearHeadwiseExpand( # This expects inner_dim to be the input to Q, K, V
+            dim=inner_dim, # Input dim to Q_proj
+            num_heads=num_heads, # Output will be inner_dim * num_heads if not careful
+            bias=proj_bias,
+        )
+        self.k_proj = LinearHeadwiseExpand(
+            dim=inner_dim,
+            num_heads=num_heads,
+            bias=proj_bias,
+        )
+        self.v_proj = LinearHeadwiseExpand(
+            dim=inner_dim, # V_proj takes x_mlstm which is inner_dim
+            num_heads=num_heads,
+            bias=proj_bias,
+        )
+
+        if conv_kind == "causal1d":
+            # self.conv = CausalConv1d( # Assuming CausalConv1d is defined elsewhere
+            #     dim=inner_dim,
+            #     kernel_size=conv_kernel_size,
+            #     bias=conv_bias,
+            # )
+            # Using a simple Conv1d for placeholder
+            self.conv = nn.Conv1d(inner_dim, inner_dim, kernel_size=conv_kernel_size, padding=(conv_kernel_size-1)//2, groups=inner_dim, bias=conv_bias)
+
+        elif conv_kind == "2d": # This implies input x_mlstm is (B, H, W, C) or similar
+                               # but typical sequence models use (B, S, C)
+                               # Assuming SequenceConv2d handles (B,S,C) by treating S as spatial-like
+            assert conv_kernel_size % 2 == 1, \
+                f"same output shape as input shape is required -> even kernel sizes not supported"
+            self.conv = SequenceConv2d(
+                in_channels=inner_dim,
+                out_channels=inner_dim,
+                kernel_size=conv_kernel_size,
+                padding=conv_kernel_size // 2,
+                groups=inner_dim, # This makes it a depthwise-like conv
+                bias=conv_bias,
+                seqlens=seqlens,
+            )
+        else:
+            raise NotImplementedError
+        self.mlstm_cell = MatrixLSTMCell(
+            dim=inner_dim, # This should match the output dim of Q, K, V projections
+                           # The placeholder MatrixLSTMCell takes inner_dim * 3 if q,k,v are inner_dim
+                           # Let's adjust placeholder MatrixLSTMCell to take inner_dim for q,k,v
+            num_heads=qkv_block_size, # This seems to be head_dim for mLSTM cell
+            norm_bias=norm_bias,
+            chunk_size=chunk_size
+        )
+        self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
+
+        self.proj_down = nn.Linear(
+            in_features=inner_dim, # Input from h_state
+            out_features=dim,
+            bias=proj_bias,
+        )
+        self.reset_parameters()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, _ = x.shape
+
+        # alternate direction in successive layers
+        if self.direction == SequenceTraversal.ROWWISE_FROM_TOP_LEFT:
+            pass
+        elif self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            x = x.flip(dims=[1])
+        else:
+            raise NotImplementedError
+
+        # up-projection
+        with record_function("ViLLayer::proj_up"): # Tag this operation
+            x_inner = self.proj_up(x)
+        with record_function("ViLLayer::chunk"):
+            x_mlstm, z = torch.chunk(x_inner, chunks=2, dim=-1)
+
+        # mlstm branch
+        with record_function("ViLLayer::conv"):
+            x_mlstm_conv = self.conv(x_mlstm)
+        with record_function("ViLLayer::silu_conv"):
+            x_mlstm_conv_act = F.silu(x_mlstm_conv)
+
+        with record_function("ViLLayer::q_proj"):
+            q = self.q_proj(x_mlstm_conv_act)
+        with record_function("ViLLayer::k_proj"):
+            k = self.k_proj(x_mlstm_conv_act)
+        with record_function("ViLLayer::v_proj"):
+            v = self.v_proj(x_mlstm) # Note: v_proj input is x_mlstm, not x_mlstm_conv_act
+
+        with record_function("ViLLayer::mlstm_cell"):
+            h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+        with record_function("ViLLayer::skip_connection"):
+            h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_mlstm_conv_act)
+
+        # output / z branch
+        with record_function("ViLLayer::silu_z_multiply"):
+            h_state = h_tilde_state_skip * F.silu(z)
+
+        # down-projection
+        with record_function("ViLLayer::proj_down"):
+            x_out = self.proj_down(h_state)
+
+        # reverse alternating flip
+        if self.direction == SequenceTraversal.ROWWISE_FROM_TOP_LEFT:
+            pass
+        elif self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            x_out = x_out.flip(dims=[1])
+        else:
+            raise NotImplementedError
+
+        return x_out
+
+    def reset_parameters(self):
+        # init inproj
+        small_init_(self.proj_up.weight, dim=self.dim)
+        if self.proj_up.bias is not None:
+            nn.init.zeros_(self.proj_up.bias)
+        # init outproj (original mLSTM uses num_blocks=1)
+        if self.init_weights == "original":
+            wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=1)
+        elif self.init_weights == "original-fixed":
+            wang_init_(self.proj_down.weight, dim=self.dim, num_blocks=self.num_blocks)
+        else:
+            raise NotImplementedError
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
+
+        nn.init.ones_(self.learnable_skip)
+
+        def _init_qkv_proj(qkv_proj: LinearHeadwiseExpand):
+            # use the embedding dim instead of the inner embedding dim
+            small_init_(qkv_proj.weight, dim=self.dim)
+            if qkv_proj.bias is not None:
+                nn.init.zeros_(qkv_proj.bias)
+
+        _init_qkv_proj(self.q_proj)
+        _init_qkv_proj(self.k_proj)
+        _init_qkv_proj(self.v_proj)
+
+        self.mlstm_cell.reset_parameters()
