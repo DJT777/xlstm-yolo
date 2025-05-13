@@ -73,7 +73,8 @@ from .block import (
     PatchMerger,
     PermuteBlock,
     FlattenPosEmbedBlock,
-    PatchMerging
+    PatchMerging,
+    ViLBlock
 )
 from .conv import (
     CBAM,

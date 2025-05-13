@@ -79,7 +79,8 @@ from ultralytics.nn.modules import (
     PatchMerger,
     PermuteBlock,
     FlattenPosEmbedBlock,
-    PatchMerging
+    PatchMerging,
+    ViLBlock
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -1209,7 +1210,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         # elif m is ViLPairBlockWrapper:
         #     c1 = ch[f]
         #     c2 = args[0]  # dim from args, e.g., 256, 512, or 1024
-        elif m in {ViLBlockPairBlock, ViLFusionBlock}:
+        elif m in {ViLBlockPairBlock, ViLFusionBlock, ViLBlock}:
             c1 = ch[f]            
             c2 = args[1]  # c2 from args3
         elif m is VisionClueMerge:

@@ -69,7 +69,8 @@ __all__ = (
     "PatchMerger",
     "PermuteBlock",
     "FlattenPosEmbedBlock",
-    "PatchMerging"
+    "PatchMerging",
+    "VilBlock"
 )
 
 import math
@@ -2129,26 +2130,6 @@ class VisionClueMerge(nn.Module):
         }
 
 
-# class VisionClueMerge(nn.Module):
-#     def __init__(self, dim, out_dim):
-#         super().__init__()
-#         self.hidden = int(dim * 4)
-
-#         self.pw_linear = nn.Sequential(
-#             nn.Conv2d(self.hidden, out_dim, kernel_size=1, stride=1, padding=0),
-#             nn.BatchNorm2d(out_dim),
-#             nn.SiLU()
-#         )
-
-#     def forward(self, x):
-#         y = torch.cat([
-#             x[..., ::2, ::2],
-#             x[..., 1::2, ::2],
-#             x[..., ::2, 1::2],
-#             x[..., 1::2, 1::2]
-#         ], dim=1)
-#         return self.pw_linear(y)
-    
 
 
 class PatchMerger(nn.Module):
@@ -2229,6 +2210,142 @@ class ViLLayerNormBlock(nn.Module):
 
 
 
+class ViLBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int,
+        config: dict,
+        n: int = 1,
+        mlp_ratio: float = 4.0,
+        drop_path: float = 0.0,
+        mlp_act_layer=nn.GELU,
+        mlp_drop_rate: float = 0.0,
+    ):
+        """
+        Initialize the FusionViLBlock, mirroring XSSBlock logic with ViLBlockPairBlock.
+
+        Args:
+            in_channels (int): Number of input channels.
+            hidden_dim (int): Hidden dimension after projection.
+            config (dict): Configuration dict with 'seqlens', etc.
+            n (int): Number of ViLBlockPairBlock repetitions.
+            mlp_ratio (float): Expansion ratio for MLP hidden dimension.
+            drop_path (float): Drop path probability.
+            norm_layer (callable): Normalization layer constructor.
+            mlp_act_layer (type): Activation layer for MLP.
+            mlp_drop_rate (float): Dropout rate for MLP.
+        """
+        super().__init__()
+
+        # print(config)
+        # Extract seqlens from config
+        seqlens = config.get("seqlens")
+        n = config.get("n", 1)
+        mlp_ratio = config.get("mlp_ratio", 4.0)
+        drop_path = config.get("drop_path", 0.0)
+        if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
+            raise ValueError("config['seqlens'] must be a list/tuple of length 2 or 3")
+
+        
+        self.seqlens = seqlens
+        self.hidden_dim = hidden_dim
+
+        # Local spatial processing (LSBlock from XSSBlock)
+        self.lsblock = LSBlock(hidden_dim, hidden_dim)
+
+        # Normalization for sequence input (B, S, D)
+        self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
+
+        # ViLBlockPairBlock replacing SS2D
+        self.vil = nn.Sequential(*[
+            ViLBlockPairBlock(hidden_dim, hidden_dim, config)
+            for _ in range(n)
+        ])
+
+        # DropPath from vision_lstm_util.py
+        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
+
+        # Optional MLP branch (same as XSSBlock)
+        self.mlp_branch = mlp_ratio > 0
+        if self.mlp_branch:
+            self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)  # Sequence norm
+            mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+            self.mlp = RGBlock(
+                in_features=hidden_dim,
+                hidden_features=mlp_hidden_dim,
+                act_layer=mlp_act_layer,
+                drop=mlp_drop_rate
+            )
+
+    def forward(self, x):
+        """
+        Forward pass with internal reshaping.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape [B, S, D] or [B, H, W, D].
+
+        Returns:
+            torch.Tensor: Output tensor of shape [B, S, D].
+        """
+        if x.ndim == 4:
+            # Input is [B, H, W, D], rearrange to [B, S, D]
+            B, H, W, D = x.shape
+            if len(self.seqlens) == 2:
+                expected_H, expected_W = self.seqlens
+                assert H == expected_H and W == expected_W, \
+                    f"Input grid {H}x{W} does not match seqlens {expected_H}x{expected_W}"
+                x = einops.rearrange(x, "b h w d -> b (h w) d")
+            else:
+                raise ValueError("3D seqlens not supported for 4D input")
+        elif x.ndim == 3:
+            # Input is [B, S, D]
+            B, S, D = x.shape
+            if len(self.seqlens) == 2:
+                H, W = self.seqlens
+                assert S == H * W, f"Sequence length {S} does not match seqlens {H}*{W}"
+            else:
+                raise ValueError("3D seqlens not supported for 3D input")
+        else:
+            raise ValueError("Input must be 3D or 4D tensor")
+
+        # Now x is [B, S, D]
+        # Reshape to [B, D, H, W] for spatial processing
+        H, W = self.seqlens
+        x_image = einops.rearrange(x, "b (h w) d -> b d h w", h=H, w=W)
+
+        # Local spatial processing
+        x_local = self.lsblock(x_image)  # (B, hidden_dim, H, W)
+
+        # Flatten to sequence for ViLBlockPairBlock
+        seq = einops.rearrange(x_local, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
+
+        # Normalize and process with ViLBlockPairBlock
+        seq_out = self.vil(seq)  # (B, S, hidden_dim)
+
+        # Apply drop path and residual connection in sequence space
+        seq = seq + self.drop_path(seq_out)  # (B, S, hidden_dim)
+
+        # Reshape back to 4D for residual connection
+        x_global = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
+
+        # Residual connection with original input
+        x_image = x_image + x_global  # (B, hidden_dim, H, W)
+
+        # Optional MLP branch
+        if self.mlp_branch:
+            # Flatten again for MLP (RGBlock expects 4D input)
+            seq = einops.rearrange(x_image, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
+            # Reshape to 4D for RGBlock
+            x_mlp = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
+            x_mlp = self.mlp(x_mlp)  # (B, hidden_dim, H, W)
+            # Add back with drop path
+            x_image = x_image + self.drop_path(x_mlp)  # (B, hidden_dim, H, W)
+
+        # Reshape back to sequence format for output
+        x_out = einops.rearrange(x_image, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
+        return x_out
+
 class ViLFusionBlock(nn.Module):
     def __init__(
         self,
@@ -2260,7 +2377,7 @@ class ViLFusionBlock(nn.Module):
         # print(config)
         # Extract seqlens from config
         seqlens = config.get("seqlens")
-        # mlp_ratio = config.get("mlp_ratio")
+        mlp_ratio = config.get("mlp_ratio")
         if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
             raise ValueError("config['seqlens'] must be a list/tuple of length 2 or 3")
 
@@ -2364,213 +2481,6 @@ class PatchMerger(nn.Module):
         attn = sim.softmax(dim=-1)
         return torch.matmul(attn, x)
 
-# class ViLFusionBlock(nn.Module):
-#     class _LocalSpatial(nn.Module):
-#         def __init__(self, dim, act_layer=nn.GELU, drop=0.):
-#             super().__init__()
-#             self.dw3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
-#             self.bn = nn.BatchNorm2d(dim)
-#             self.pw1 = nn.Conv2d(dim, dim, 1)
-#             self.act = act_layer()
-#             self.pw2 = nn.Conv2d(dim, dim, 1)
-#             self.drop = nn.Dropout(drop)
-
-#         def forward(self, x):
-#             res = x
-#             x = self.pw2(self.act(self.pw1(self.bn(self.dw3(x)))))
-#             return res + self.drop(x)
-
-#     def __init__(self, in_channels, hidden_dim, config):
-#         super().__init__()
-#         seqlens = config["seqlens"]
-#         n_vil = config.get("n_vil", 1)
-#         drop_path = config.get("drop_path", 0.0)
-#         mlp_ratio = config.get("mlp_ratio", 4.0)
-
-#         self.in_proj = (
-#             nn.Sequential(
-#                 nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
-#                 nn.BatchNorm2d(hidden_dim),
-#                 nn.SiLU(),
-#             ) if in_channels != hidden_dim else nn.Identity()
-#         )
-
-#         self.local = ViLFusionBlock._LocalSpatial(hidden_dim)
-
-#         self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
-#         self.vil = nn.Sequential(*[
-#             ViLBlockPair(
-#                 dim=hidden_dim,
-#                 drop_path=drop_path,
-#                 seqlens=seqlens,
-#                 conv_kind="3d" if len(seqlens) == 3 else "2d",
-#             ) for _ in range(n_vil)
-#         ])
-#         self.dp = DropPath(drop_prob=drop_path)
-
-#         self.use_mlp = mlp_ratio > 0
-#         if self.use_mlp:
-#             mlp_hidden = int(hidden_dim * mlp_ratio)
-#             self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
-#             self.mlp = nn.Sequential(
-#                 nn.Conv2d(hidden_dim, mlp_hidden * 2, 1),
-#                 nn.GELU(),
-#                 nn.Conv2d(mlp_hidden, hidden_dim, 1),
-#             )
-#             self.dp2 = DropPath(drop_prob=drop_path)
-
-#     @staticmethod
-#     def _hw_flat(x):
-#         B, D, *spatial = x.shape
-#         return x.flatten(2).transpose(1, 2), spatial
-
-#     @staticmethod
-#     def _hw_unflat(seq, spatial):
-#         B, S, D = seq.shape
-#         return seq.transpose(1, 2).view(B, D, *spatial)
-
-#     def forward(self, x):
-#         x = self.in_proj(x)  # Shape: [B, hidden_dim, H, W]
-#         x_local = self.local(x)  # Shape: [B, hidden_dim, H, W]
-        
-#         seq, spatial = self._hw_flat(x_local)  # seq: [B, S, hidden_dim], spatial: (H, W)
-#         seq_id = seq
-#         seq_res = self.vil(self.norm(seq_id))  # Shape: [B, S, hidden_dim]
-#         seq = self.dp(seq_id, lambda _: seq_res)  # Shape: [B, S, hidden_dim]
-#         x_global = self._hw_unflat(seq, spatial)  # Shape: [B, hidden_dim, H, W]
-        
-#         x = x + x_global  # Shape: [B, hidden_dim, H, W]
-        
-#         if self.use_mlp:
-#             x_id = x  # Shape: [B, hidden_dim, H, W]
-#             # Step 1: Permute to move channel dimension to the end
-#             x_permuted = x_id.permute(0, 2, 3, 1)  # Shape: [B, H, W, hidden_dim]
-#             # Step 2: Apply LayerNorm over the last dimension (hidden_dim = 128)
-#             x_norm = self.norm2(x_permuted)  # Shape: [B, H, W, hidden_dim]
-#             # Step 3: Permute back to original order
-#             x_norm = x_norm.permute(0, 3, 1, 2)  # Shape: [B, hidden_dim, H, W]
-            
-#             x_res = self.mlp(x_norm)  # Shape: [B, hidden_dim, H, W]
-#             x = self.dp2(x_id, lambda _: x_res)  # Shape: [B, hidden_dim, H, W]
-        
-#         return x
-
-# class ViLFusionBlock(nn.Module):
-#     """
-#     XSS‑style fusion layer that uses ViL for the long‑range part and
-#     **re‑implements LSBlock locally** (no external dependency).
-
-#     Parameters
-#     ----------
-#     in_channels : int   # C_in from backbone
-#     hidden_dim  : int   # embedding dimension D
-#     seqlens     : tuple # (H, W) or (T, H, W) – passed to ViLBlockPair
-#     n_vil       : int   # stacked ViLBlockPair layers
-#     drop_path   : float
-#     mlp_ratio   : float # 0 disables the conv‑MLP branch
-#     """
-
-#     # ---------- 1.  LOCAL‑SPATIAL BLOCK (rewritten LSBlock) -----------------
-#     class _LocalSpatial(nn.Module):
-#         """Depth‑wise 3×3 → BN → 1×1 → GELU → 1×1 with residual & dropout
-#         (identical math to LSBlock)"""
-#         def __init__(self, dim, act_layer=nn.GELU, drop=0.):
-#             super().__init__()
-#             self.dw3 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)   # depth‑wise
-#             self.bn  = nn.BatchNorm2d(dim)
-#             self.pw1 = nn.Conv2d(dim, dim, 1)
-#             self.act = act_layer()
-#             self.pw2 = nn.Conv2d(dim, dim, 1)
-#             self.drop = nn.Dropout(drop)
-
-#         def forward(self, x):
-#             res = x
-#             x = self.dw3(x)
-#             x = self.bn(x)
-#             x = self.pw1(x)
-#             x = self.act(x)
-#             x = self.pw2(x)
-#             return res + self.drop(x)
-#     # ------------------------------------------------------------------------
-
-#     def __init__(self,
-#                  in_channels: int,
-#                  hidden_dim: int,
-#                  seqlens,
-#                  n_vil: int = 1,
-#                  drop_path: float = 0.,
-#                  mlp_ratio: float = 4.0):
-#         super().__init__()
-
-#         # 2. in‑projection (identical to XSSBlock)
-#         self.in_proj = (
-#             nn.Sequential(
-#                 nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
-#                 nn.BatchNorm2d(hidden_dim),
-#                 nn.SiLU()
-#             ) if in_channels != hidden_dim else nn.Identity()
-#         )
-
-#         # 3. local‑spatial stage (rewritten)
-#         self.local = ViLFusionBlock._LocalSpatial(hidden_dim)
-
-#         # 4. ViL sequence module
-#         self.norm = nn.LayerNorm(hidden_dim, eps=1e-6)
-#         self.vil = nn.Sequential(*[
-#             ViLBlockPair(
-#                 dim=hidden_dim,
-#                 drop_path=drop_path,
-#                 seqlens=seqlens,
-#                 conv_kind="3d" if len(seqlens) == 3 else "2d",
-#             ) for _ in range(n_vil)
-#         ])
-#         self.dp = DropPath(drop_path)
-
-#         # 5. optional conv‑MLP branch (same RGBlock maths)
-#         self.use_mlp = mlp_ratio > 0
-#         if self.use_mlp:
-#             mlp_hidden = int(hidden_dim * mlp_ratio)
-#             self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)
-#             self.mlp = nn.Sequential(
-#                 nn.Conv2d(hidden_dim, mlp_hidden * 2, 1),
-#                 nn.GELU(),
-#                 nn.Conv2d(mlp_hidden, hidden_dim, 1)  # channel‑mixing conv‑MLP
-#             )
-#             self.dp2 = DropPath(drop_path)
-
-#     # ---------- helper: flatten ↔︎ unflatten -----------------
-#     @staticmethod
-#     def _hw_flat(x):
-#         B, D, *spatial = x.shape
-#         return x.flatten(2).transpose(1, 2), spatial   # (B,S,D), (H,W[,T])
-
-#     @staticmethod
-#     def _hw_unflat(seq, spatial):
-#         B, S, D = seq.shape
-#         return seq.transpose(1, 2).view(B, D, *spatial)
-#     # ---------------------------------------------------------
-
-#     def forward(self, x):
-#         """
-#         x : (B, C_in, H, W)  or  (B, C_in, T, H, W)
-#         """
-#         x = self.in_proj(x)
-
-#         # local spatial conditioning
-#         x_local = self.local(x)
-
-#         # ViL global fusion
-#         seq, spatial = self._hw_flat(x_local)
-#         seq = seq + self.dp(self.vil(self.norm(seq)))
-#         x_global = self._hw_unflat(seq, spatial)
-
-#         x = x + x_global      # first residual
-
-#         # optional MLP
-#         if self.use_mlp:
-#             x = x + self.dp2(self.mlp(self.norm2(x)))
-
-#         return x
 
 nn.ViLLayerNormBlock = ViLLayerNormBlock
 nn.ViLInternalNorm = LayerNorm 
