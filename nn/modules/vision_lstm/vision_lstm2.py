@@ -236,7 +236,7 @@ class ViLLayer(nn.Module):
                  chunk_size=64
     ):
         super().__init__()
-        assert dim % qkv_block_size == 0
+        assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
         self.dim = dim
         self.direction = direction
         self.expansion = expansion
@@ -250,31 +250,34 @@ class ViLLayer(nn.Module):
         self.inner_dim = inner_dim
         self.num_heads = num_heads
 
-        # Fused up projection to 2 * inner_dim for x_qk and x_v
+        # Fused up projection for Q, K, V, adjusted to 2 * inner_dim
         self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
 
         # Convolution applied only to x_qk
         if conv_kind == "causal1d":
             self.conv = CausalConv1d(inner_dim, kernel_size=conv_kernel_size, bias=conv_bias)
         elif conv_kind == "2d":
-            assert conv_kernel_size % 2 == 1
+            assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
             self.conv = SequenceConv2d(
                 inner_dim, inner_dim, kernel_size=conv_kernel_size,
                 padding=conv_kernel_size // 2, groups=inner_dim,
                 bias=conv_bias, seqlens=seqlens
             )
         else:
-            raise NotImplementedError
+            raise NotImplementedError(f"conv_kind '{conv_kind}' is not supported")
 
+        # Separate projections for Q and K (from convolved x_qk) and V (from x_v)
         self.qk_proj = nn.Linear(inner_dim, 2 * inner_dim, bias=proj_bias)
         self.v_proj = nn.Linear(inner_dim, inner_dim, bias=proj_bias)
 
+        # MatrixLSTMCell with fused ifgate and soft capping
         self.mlstm_cell = MatrixLSTMCell(
             dim=inner_dim,
             num_heads=num_heads,
             norm_bias=norm_bias,
             eps=1e-5,
-            chunk_size=chunk_size
+            chunk_size=chunk_size,
+            gate_soft_cap=gate_soft_cap
         )
 
         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
@@ -302,28 +305,28 @@ class ViLLayer(nn.Module):
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x = x.flip(dims=[1])
 
-        # Fused up projection
-        x_inner = self.proj_up(x)
-        x_qk, x_v = torch.chunk(x_inner, 2, dim=-1)
+        # Fused up projection for Q, K, V
+        x_inner = self.proj_up(x)  # (B, S, 2 * inner_dim)
+        x_qk, x_v = torch.chunk(x_inner, 2, dim=-1)  # Each (B, S, inner_dim)
 
         # Convolution on x_qk only
-        x_qk_conv_act = F.silu(self.conv(x_qk))
+        x_qk_conv_act = F.silu(self.conv(x_qk))  # (B, S, inner_dim)
 
         # Project to Q and K, and V separately
-        qk = self.qk_proj(x_qk_conv_act)
-        q, k = torch.chunk(qk, 2, dim=-1)
-        v = self.v_proj(x_v)
+        qk = self.qk_proj(x_qk_conv_act)  # (B, S, 2 * inner_dim)
+        q, k = torch.chunk(qk, 2, dim=-1)  # Each (B, S, inner_dim)
+        v = self.v_proj(x_v)  # (B, S, inner_dim)
 
         # Reshape for multi-head processing
         B, S, _ = q.shape
-        q = q.view(B, S, self.num_heads, -1).transpose(1, 2)
-        k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
-        v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
+        # q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
+        # k = k.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
+        # v = v.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
 
         # mLSTM processing
-        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
-        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_qk_conv_act)
-        x_mlstm = self.proj_down(h_tilde_state_skip)
+        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)  # (B, S, inner_dim)
+        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_qk_conv_act)  # (B, S, inner_dim)
+        x_mlstm = self.proj_down(h_tilde_state_skip)  # (B, S, dim)
 
         # Revert sequence direction if needed
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
@@ -648,169 +651,152 @@ class ViLBlock(nn.Module):
 #grok backendsclass 
 from mlstm_kernels.torch.chunkwise.triton_xl_chunk import mlstm_chunkwise__xl_chunk
 class MatrixLSTMCell(nn.Module):
-        def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float16):
-            super().__init__()
-            self.dim = dim
-            self.num_heads = num_heads
-            self.use_autocast = use_autocast  # Added to enable/disable autocasting
-            self.autocast_dtype = autocast_dtype  # Added to specify autocast dtype
+    def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float16, gate_soft_cap=15.0):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.use_autocast = use_autocast
+        self.autocast_dtype = autocast_dtype
+        self.gate_soft_cap = gate_soft_cap  # Cap value for soft capping
 
-            self.igate = nn.Linear(3 * dim, num_heads)
-            self.fgate = nn.Linear(3 * dim, num_heads)
-            self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-3)
-            self.causal_mask_cache = {}
-            chunk_size = chunk_size
+        # Fused ifgate projection
+        self.ifgate = nn.Linear(3 * dim, 2 * num_heads)
 
+        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-3)
+        self.causal_mask_cache = {}
+        self.chunk_size = chunk_size
 
+        # CPU-compatible backend configuration (remains float16)
+        self.cpu_backend_config_infer = mLSTMBackendConfig(
+            chunkwise_kernel="chunkwise--native_autograd",
+            sequence_kernel="native_sequence__native",
+            step_kernel="native",
+            chunk_size=int(chunk_size),
+            autocast_kernel_dtype="float16",
+            return_last_states=False,
+            mode="inference",
+            eps=5e-5
+        )
+        self.cpu_backend_infer = mLSTMBackend(
+            config=self.cpu_backend_config_infer,
+        )
 
-            # CPU-compatible backend configuration (remains float16)
-            self.cpu_backend_config_infer = mLSTMBackendConfig(
-                chunkwise_kernel="chunkwise--native_autograd",
-                sequence_kernel="native_sequence__native",
-                step_kernel="native",
-                chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float16",
-                return_last_states=False,
-                mode="inference",
-                eps=5e-5
-            )
-            self.cpu_backend_infer = mLSTMBackend(
-                config=self.cpu_backend_config_infer,
-            )
+        # GPU-compatible (Triton) backend configuration
+        self.gpu_backend_config_infer = mLSTMBackendConfig(
+            chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
+            sequence_kernel="native_sequence__triton",
+            step_kernel="triton",
+            chunk_size=int(chunk_size),
+            autocast_kernel_dtype="float16",
+            return_last_states=False,
+            mode="inference",
+            eps=5e-5
+        )
+        self.gpu_backend_infer = mLSTMBackend(
+            config=self.gpu_backend_config_infer,
+        )
 
-            # GPU-compatible (Triton) backend configuration
-            self.gpu_backend_config_infer = mLSTMBackendConfig(
-                chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
-                sequence_kernel="native_sequence__triton",
-                step_kernel="triton",
-                chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float16",  # Autocast in forward pass can override this
-                return_last_states=False,
-                mode="inference",
-                eps=5e-5
-            )
-            self.gpu_backend_infer = mLSTMBackend(
-                config=self.gpu_backend_config_infer,
-            )
+        # CPU-compatible backend configuration (remains float16)
+        self.cpu_backend_config = mLSTMBackendConfig(
+            chunkwise_kernel="chunkwise--native_autograd",
+            sequence_kernel="native_sequence__native",
+            step_kernel="native",
+            chunk_size=int(chunk_size),
+            autocast_kernel_dtype="float16",
+            return_last_states=False,
+            mode="train",
+            eps=5e-5
+        )
+        self.cpu_backend = mLSTMBackend(
+            config=self.cpu_backend_config,
+        )
 
+        # GPU-compatible (Triton) backend configuration
+        self.gpu_backend_config = mLSTMBackendConfig(
+            chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
+            sequence_kernel="native_sequence__triton",
+            step_kernel="triton",
+            chunk_size=int(chunk_size),
+            autocast_kernel_dtype="float16",
+            return_last_states=False,
+            mode="train",
+            eps=5e-5
+        )
+        self.gpu_backend = mLSTMBackend(
+            config=self.gpu_backend_config,
+        )
 
-            # CPU-compatible backend configuration (remains float16)
-            self.cpu_backend_config = mLSTMBackendConfig(
-                chunkwise_kernel="chunkwise--native_autograd",
-                sequence_kernel="native_sequence__native",
-                step_kernel="native",
-                chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float16",
-                return_last_states=False,
-                mode="train",
-                eps=5e-5
-            )
-            self.cpu_backend = mLSTMBackend(
-                config=self.cpu_backend_config,
-            )
+        self.reset_parameters()
 
-            # GPU-compatible (Triton) backend configuration
-            self.gpu_backend_config = mLSTMBackendConfig(
-                chunkwise_kernel="chunkwise--triton_xl_chunk_siging",
-                sequence_kernel="native_sequence__triton",
-                step_kernel="triton",
-                chunk_size=int(chunk_size),
-                autocast_kernel_dtype="float16",  # Autocast in forward pass can override this
-                return_last_states=False,
-                mode="train",
-                eps=5e-5
-            )
-            self.gpu_backend = mLSTMBackend(
-                config=self.gpu_backend_config,
-            )
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+        B, S, H = q.shape  # (B, S, H)
+        dtype = q.dtype
+        device = q.device
 
-            self.reset_parameters()
+        if not (q.device == k.device == v.device):
+            raise ValueError("All input tensors (q, k, v) must be on the same device.")
+        backend = self.gpu_backend if device.type == 'cuda' else self.cpu_backend
 
+        # Prepare gate inputs
+        if_gate_input = torch.cat([q, k, v], dim=-1)  # (B, S, 3 * H)
+        
+        # Compute fused ifgate preactivations and apply soft_cap
+        if_preact = self.ifgate(if_gate_input)  # (B, S, 2 * NH)
+        if_preact_capped = self.soft_cap(if_preact, self.gate_soft_cap)  # Cap the preactivations
+        
+        # Split into input and forget gate preactivations
+        i_preact, f_preact = torch.chunk(if_preact_capped, 2, dim=-1)  # Each (B, S, NH)
+        
+        # Transpose for backend
+        i = i_preact.transpose(-1, -2)  # (B, NH, S)
+        f = f_preact.transpose(-1, -2)  # (B, NH, S)
 
-        def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-            B, S, H = q.shape  # (B, S, H)
-            # print("Input type" + str(q.dtype))
-            dtype = q.dtype
-            device = q.device
+        # Reshape for backend
+        q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
+        k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
+        v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
 
-            # All inputs must reside on the same device
-            if not (q.device == k.device == v.device):
-                raise ValueError("All input tensors (q, k, v) must be on the same device.")
-            backend = self.gpu_backend if device.type == 'cuda' else self.cpu_backend
+        # Compute h_state with the selected backend, applying autocast if specified
+        if device.type == 'cuda' and self.use_autocast and self.training:
+            q = q.to(self.autocast_dtype)
+            k = k.to(self.autocast_dtype)
+            v = v.to(self.autocast_dtype)
+            i = i.to(self.autocast_dtype)
+            f = f.to(self.autocast_dtype)
+            h_state = backend(q=q, k=k, v=v, i=i, f=f)
+        elif device.type == 'cpu' and self.training:
+            h_state = backend(q=q, k=k, v=v, i=i, f=f)
+        elif device.type == 'cuda' and self.use_autocast and not self.training:
+            q = q.to(self.autocast_dtype)
+            k = k.to(self.autocast_dtype)
+            v = v.to(self.autocast_dtype)
+            i = i.to(self.autocast_dtype)
+            f = f.to(self.autocast_dtype)
+            h_state = backend(q=q, k=k, v=v, i=i, f=f)
+        elif device.type == 'cpu' and not self.training:
+            h_state = backend(q=q, k=k, v=v, i=i, f=f)
 
-            # Prepare gate inputs
-            if_gate_input = torch.cat([q, k, v], dim=-1)
-            i = self.igate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
-            f = self.fgate(if_gate_input).transpose(-1, -2)  # (B, NH, S)
+        h_state = h_state.to(dtype)
+        h_state_norm = self.outnorm(h_state)  # (B, NH, S, head_dim)
+        h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, -1)  # (B, S, H)
 
-            # Reshape for backend
-            q = q.view(B, S, self.num_heads, -1).transpose(1, 2)
-            k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
-            v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
+        return h_state_norm
 
-            # Compute h_state with the selected backend, applying autocast if specified
-            if device.type == 'cuda' and self.use_autocast and self.training:
-                q = q.to(self.autocast_dtype)
-                k = k.to(self.autocast_dtype)
-                v = v.to(self.autocast_dtype)
-                i = i.to(self.autocast_dtype)
-                f = f.to(self.autocast_dtype)
-                # print("Autocast type" + str(q.dtype))
-                h_state = backend(
-                    q=q,
-                    k=k,
-                    v=v,
-                    i=i,
-                    f=f,
-                )  
-            elif device.type == 'cpu' and self.training:
-                h_state = backend(
-                    q=q,
-                    k=k,
-                    v=v,
-                    i=i,
-                    f=f,
-                )  # (B, NH, S, DH)
-                        # Compute h_state with the selected backend, applying autocast if specified
-            if device.type == 'cuda' and self.use_autocast and not self.training:
-                q = q.to(self.autocast_dtype)
-                k = k.to(self.autocast_dtype)
-                v = v.to(self.autocast_dtype)
-                i = i.to(self.autocast_dtype)
-                f = f.to(self.autocast_dtype)
-                h_state = backend(
-                    q=q,
-                    k=k,
-                    v=v,
-                    i=i,
-                    f=f,
-                )  # (B, NH, S, DH)
-            elif device.type == 'cpu' and not self.training:
-                h_state = backend(
-                    q=q,
-                    k=k,
-                    v=v,
-                    i=i,
-                    f=f,
-                )  # (B, NH, S, DH)
+    def soft_cap(self, x, cap_value):
+        return cap_value * torch.tanh(x / cap_value)
 
-            h_state = h_state.to(dtype)
-            h_state_norm = self.outnorm(h_state)  # (B, NH, S, DH)
-            h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, -1)  # (B, NH, S, DH) -> (B, S, NH, DH) -> (B, S, H)
-
-            # print("Output type" + str(h_state.dtype))
-            # Force output to match input dtype
-            return h_state_norm
-
-        def reset_parameters(self):
-            self.outnorm.reset_parameters()
-            # Forget gate initialization
-            torch.nn.init.zeros_(self.fgate.weight)
-            bias_linspace_init_(self.fgate.bias, start=3.0, end=6.0)
-            # Input gate initialization
-            torch.nn.init.zeros_(self.igate.weight)
-            torch.nn.init.constant_(self.igate.bias, -10)
-            #torch.nn.init.normal_(self.igate.bias, mean=-10, std=0.1)
+    def reset_parameters(self):
+        self.outnorm.reset_parameters()
+        # Initialize fused ifgate
+        torch.nn.init.zeros_(self.ifgate.weight)  # Shape: (2 * num_heads, 3 * dim)
+        
+        # Create the bias tensor
+        i_bias = torch.full((self.num_heads,), -10, dtype=self.ifgate.bias.dtype, device=self.ifgate.bias.device)
+        f_bias = torch.linspace(3.0, 6.0, steps=self.num_heads, dtype=self.ifgate.bias.dtype, device=self.ifgate.bias.device)
+        bias = torch.cat([i_bias, f_bias], dim=0)
+        
+        # Assign to bias.data
+        self.ifgate.bias.data = bias
 
 
 
