@@ -245,12 +245,15 @@ class ViLLayer(nn.Module):
         self.weight_mode = weight_mode
         self.num_blocks = num_blocks
 
+        # Compute dimensions
         inner_dim = expansion * dim
         num_heads = inner_dim // qkv_block_size
         self.inner_dim = inner_dim
         self.num_heads = num_heads
+        self.DHQK = qkv_block_size
+        self.DHHV = 2 * qkv_block_size
 
-        # Fused up projection for Q, K, V, adjusted to 2 * inner_dim
+        # Fused up projection for Q, K, V
         self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
 
         # Convolution applied only to x_qk
@@ -266,11 +269,13 @@ class ViLLayer(nn.Module):
         else:
             raise NotImplementedError(f"conv_kind '{conv_kind}' is not supported")
 
-        # Separate projections for Q and K (from convolved x_qk) and V (from x_v)
-        self.qk_proj = nn.Linear(inner_dim, 2 * inner_dim, bias=proj_bias)
-        self.v_proj = nn.Linear(inner_dim, inner_dim, bias=proj_bias)
+        # Separate projections for Q, K, and V
+        qk_dim = num_heads * self.DHQK  # Dimension for q and k each
+        v_dim = num_heads * self.DHHV   # Dimension for v
+        self.qk_proj = nn.Linear(inner_dim, 2 * qk_dim, bias=proj_bias)  # 2 * num_heads * DHQK
+        self.v_proj = nn.Linear(inner_dim, v_dim, bias=proj_bias)        # num_heads * DHHV
 
-        # MatrixLSTMCell with fused ifgate and soft capping
+        # mLSTM cell
         self.mlstm_cell = MatrixLSTMCell(
             dim=inner_dim,
             num_heads=num_heads,
@@ -280,11 +285,13 @@ class ViLLayer(nn.Module):
             gate_soft_cap=gate_soft_cap
         )
 
+        # Additional projection to match inner_dim for skip connection
+        self.out_proj = nn.Linear(v_dim, inner_dim, bias=proj_bias)
+
         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
 
         self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-        # FFN with its own normalization
         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
         self.ffn = FeedForward(
             embedding_dim=dim,
@@ -305,26 +312,31 @@ class ViLLayer(nn.Module):
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             x = x.flip(dims=[1])
 
-        # Fused up projection for Q, K, V
+        # Fused up projection
         x_inner = self.proj_up(x)  # (B, S, 2 * inner_dim)
         x_qk, x_v = torch.chunk(x_inner, 2, dim=-1)  # Each (B, S, inner_dim)
 
-        # Convolution on x_qk only
+        # Convolution on x_qk
         x_qk_conv_act = F.silu(self.conv(x_qk))  # (B, S, inner_dim)
 
-        # Project to Q and K, and V separately
-        qk = self.qk_proj(x_qk_conv_act)  # (B, S, 2 * inner_dim)
-        q, k = torch.chunk(qk, 2, dim=-1)  # Each (B, S, inner_dim)
-        v = self.v_proj(x_v)  # (B, S, inner_dim)
+        # Project to Q, K, and V
+        qk = self.qk_proj(x_qk_conv_act)  # (B, S, 2 * num_heads * DHQK)
+        v = self.v_proj(x_v)              # (B, S, num_heads * DHHV)
+        q, k = torch.chunk(qk, 2, dim=-1) # Each (B, S, num_heads * DHQK)
 
         # Reshape for multi-head processing
         B, S, _ = q.shape
-        # q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
-        # k = k.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
-        # v = v.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
+        q = q.view(B, S, self.num_heads, self.DHQK).transpose(1, 2)  # (B, NH, S, DHQK)
+        k = k.view(B, S, self.num_heads, self.DHQK).transpose(1, 2)  # (B, NH, S, DHQK)
+        v = v.view(B, S, self.num_heads, self.DHHV).transpose(1, 2)  # (B, NH, S, DHHV)
 
         # mLSTM processing
-        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)  # (B, S, inner_dim)
+        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)  # (B, NH, S, DHHV)
+        h_tilde_state = h_tilde_state.transpose(1, 2).contiguous()  # (B, S, NH, DHHV)
+        h_tilde_state = h_tilde_state.view(B, S, -1)  # (B, S, num_heads * DHHV)
+        h_tilde_state = self.out_proj(h_tilde_state)  # (B, S, inner_dim)
+
+        # Skip connection
         h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_qk_conv_act)  # (B, S, inner_dim)
         x_mlstm = self.proj_down(h_tilde_state_skip)  # (B, S, dim)
 
@@ -344,7 +356,6 @@ class ViLLayer(nn.Module):
         return x
 
     def reset_parameters(self):
-        # Initialize weights as per original conventions
         small_init_(self.proj_up.weight, self.dim)
         if self.proj_up.bias is not None:
             nn.init.zeros_(self.proj_up.bias)
@@ -356,6 +367,10 @@ class ViLLayer(nn.Module):
         small_init_(self.v_proj.weight, self.dim)
         if self.v_proj.bias is not None:
             nn.init.zeros_(self.v_proj.bias)
+
+        small_init_(self.out_proj.weight, self.inner_dim)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
 
         wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
         if self.proj_down.bias is not None:
