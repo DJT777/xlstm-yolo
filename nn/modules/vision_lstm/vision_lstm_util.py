@@ -101,10 +101,26 @@ class SequenceConv2d(nn.Conv2d):
     def forward(self, x):
         assert x.ndim == 3
         if self.seqlens is None:
-            h = math.sqrt(x.size(1))
-            assert h.is_integer()
-            h = int(h)
+                    if x.size(1) <= 0: # Add a check for non-positive sequence lengths if necessary
+                        raise ValueError(f"Input sequence length x.size(1) must be positive, got {x.size(1)}")
+
+                    h_float = math.sqrt(x.size(1))
+                    # More robust check for perfect square that avoids float.is_integer()
+                    # and handles potential floating point inaccuracies for very large numbers if they were an issue.
+                    # For typical sequence lengths, simple comparison after int cast is fine.
+                    h_int_candidate = int(h_float)
+
+                    if h_int_candidate * h_int_candidate != x.size(1):
+                        # This means x.size(1) was not a perfect square.
+                        # The assertion message can be more informative.
+                        raise AssertionError(
+                            f"For SequenceConv2d with seqlens=None, the input sequence length x.size(1) "
+                            f"(which is {x.size(1)}) must be a perfect square. "
+                            f"Calculated sqrt was {h_float}."
+                        )
+                    h = h_int_candidate # Now h is confirmed to be an integer
         else:
+            # ... (rest of the code remains the same)
             assert len(self.seqlens) == 2
             h = self.seqlens[0]
         x = einops.rearrange(x, "b (h w) d -> b d h w", h=h)
