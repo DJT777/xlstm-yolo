@@ -1877,6 +1877,31 @@ class PermuteBlock(nn.Module):
         assert S == expected_S, f"Expected sequence length {expected_S}, got {S}"
         return einops.rearrange(x, "b (h w) d -> b h w d", h=H, w=W)
 
+
+
+class ImageToSequence(nn.Module):
+    """
+    Reshapes an image-format tensor [B, C, H, W] to a sequence format [B, H*W, C].
+    No arguments are needed in the YAML for this block if it purely reshapes.
+    """
+    def __init__(self, *args, **kwargs): # c1 will be passed by parse_model but not used
+        super().__init__()
+        # No parameters needed for this specific reshape operation
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor of shape [B, C, H, W].
+        Returns:
+            torch.Tensor: Output tensor of shape [B, H*W, C].
+        """
+        if x.ndim != 4:
+            raise ValueError(f"ImageToSequence expects 4D input [B, C, H, W], but got {x.ndim}D shape {x.shape}")
+        # Using einops for clear rearrangement:
+        # b - batch, c - channels, h - height, w - width
+        # The (h w) signifies that height and width are combined into the sequence length.
+        return einops.rearrange(x, 'b c h w -> b (h w) c')
+
 class ViLBlockPairBlock(nn.Module):
     """
     A block for VisionLSTM that processes sequence features without managing hidden states.
@@ -1919,7 +1944,7 @@ class ViLBlockPairBlock(nn.Module):
         else:
             raise ValueError("seqlens must be a list/tuple of length 2 (2D) or 3 (3D)")
 
-        # print(seqlens)
+        print(seqlens)
         #print(config.get("chunk_size", 256))
         # Initialize the underlying ViLBlockPair without hidden state management
         #print("BLOCK SIZE " + str(config.get("qkv_block_size", 16)))
