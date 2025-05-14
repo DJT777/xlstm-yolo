@@ -132,6 +132,113 @@ def parallel_stabilized_simple(
 
     return h_tilde_state
 
+class ConvFeedForwardSOTA(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        # Parameters from ViLLayer's FeedForward call:
+        ffn_proj_factor: float, # This will be used as the expansion factor for the GELU FFN
+        ffn_round_up_to_multiple_of: int,
+        use_bias: bool, # Passed from ViLLayer's proj_bias
+        num_blocks: int,  # Passed from ViLLayer, used for wang_init_
+        weight_mode: str = None, # ACCEPTED from ViLLayer but IGNORED by this FFN type
+
+        # New parameters specific to this ConvFeedForwardSOTA, with SOTA defaults:
+        conv_kernel_size: int = 3,
+        add_inner_norm: bool = True, # Recommended SOTA addition
+    ):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.use_bias = use_bias # Respecting the value from ViLLayer
+        self.num_blocks_for_init = num_blocks # Using the passed value
+        self.add_inner_norm = add_inner_norm
+        # weight_mode is deliberately not stored or used as it's irrelevant here.
+
+        # --- Interpret ffn_proj_factor as the expansion factor for this GELU+Conv FFN ---
+        # The original FeedForward (GLU-based) might have used ffn_proj_factor (e.g., 2.667)
+        # to define the size of each of the two GLU branches.
+        # For this new GELU-based FFN (Linear -> DWConv -> GELU -> Linear),
+        # ffn_proj_factor will define the overall expansion. A typical value for
+        # GELU FFNs is 4.0. If ViLLayer passes 2.667, this FFN will have a
+        # hidden_dim = embedding_dim * 2.667, which is slimmer than a typical 4x.
+        # This is a design choice controlled by what ViLLayer passes.
+        _ffn_expansion_factor = ffn_proj_factor
+
+        hidden_dim_intermediate = int(embedding_dim * _ffn_expansion_factor)
+        self.hidden_dim = round_up_to_next_multiple_of(
+            hidden_dim_intermediate,
+            ffn_round_up_to_multiple_of,
+        )
+
+        # 1. Up-projection Linear Layer
+        self.proj_up = nn.Linear(
+            in_features=embedding_dim,
+            out_features=self.hidden_dim,
+            bias=use_bias,
+        )
+
+        # 2. Depth-wise 1D Convolution (applied sequence-wise)
+        self.dw_conv = nn.Conv1d(
+            in_channels=self.hidden_dim,
+            out_channels=self.hidden_dim,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size // 2,
+            groups=self.hidden_dim,
+            bias=use_bias,
+        )
+
+        # 3. Activation Function
+        self.act_fn = nn.GELU()
+
+        # 4. Optional Inner Normalization
+        if self.add_inner_norm:
+            self.inner_norm = RMSNorm(self.hidden_dim, eps=1e-5)
+
+        # 5. Down-projection Linear Layer
+        self.proj_down = nn.Linear(
+            in_features=self.hidden_dim,
+            out_features=embedding_dim,
+            bias=use_bias,
+        )
+
+        self.reset_parameters()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_up = self.proj_up(x)
+        x_permuted = x_up.permute(0, 2, 1) # (B, N, H_dim) -> (B, H_dim, N)
+        x_conv_out = self.dw_conv(x_permuted)
+        x_after_conv = x_conv_out.permute(0, 2, 1) # (B, H_dim, N) -> (B, N, H_dim)
+        activated_x = self.act_fn(x_after_conv)
+
+        if self.add_inner_norm:
+            activated_x = self.inner_norm(activated_x)
+
+        y = self.proj_down(activated_x)
+        return y
+
+    def reset_parameters(self):
+        # Kaiming uniform for layers followed by GELU
+        nn.init.kaiming_uniform_(self.proj_up.weight, a=math.sqrt(5))
+        if self.proj_up.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.proj_up.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.proj_up.bias, -bound, bound)
+
+        nn.init.kaiming_uniform_(self.dw_conv.weight, a=math.sqrt(5))
+        if self.dw_conv.bias is not None:
+            # Simplified fan_in calculation for DWConv1d bias init
+            # True fan_in per output channel is kernel_size[0] since groups=in_channels
+            fan_in_per_group = self.dw_conv.kernel_size[0]
+            bound = 1 / math.sqrt(fan_in_per_group) if fan_in_per_group > 0 else 0
+            nn.init.uniform_(self.dw_conv.bias, -bound, bound)
+
+        wang_init_(
+            self.proj_down.weight,
+            input_dim_of_layer=self.hidden_dim,
+            num_total_blocks=self.num_blocks_for_init,
+        )
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
 
 class FeedForward(nn.Module):
     def __init__(
@@ -573,14 +680,24 @@ class ViLLayer(nn.Module):
 
         if seqlens[0] < 128:
             self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-            self.ffn = FeedForward(
+            self.ffn = ConvFeedForwardSOTA( # Use the new FFN class
                 embedding_dim=dim,
-                ffn_proj_factor=ffn_proj_factor,
-                ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
-                use_bias=proj_bias,
-                weight_mode=weight_mode,
-                num_blocks=num_blocks or 1,
+                ffn_proj_factor=ffn_proj_factor, # Passed from ViLLayer
+                ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of, # Passed
+                use_bias=proj_bias, # Passed
+                num_blocks=num_blocks or 1, # Passed
+                weight_mode=weight_mode, # Passed (and will be ignored by ConvFeedForwardSOTA)
+                # conv_kernel_size and add_inner_norm will use their defaults in ConvFeedForwardSOTA
+                # unless you modify ViLLayer to pass them too.
             )
+            # self.ffn = FeedForward(
+            #     embedding_dim=dim,
+            #     ffn_proj_factor=ffn_proj_factor,
+            #     ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+            #     use_bias=proj_bias,
+            #     weight_mode=weight_mode,
+            #     num_blocks=num_blocks or 1,
+            # )
         else:
             self.ffn = None
 
