@@ -74,7 +74,8 @@ from .block import (
     PermuteBlock,
     FlattenPosEmbedBlock,
     PatchMerging,
-    ViLBlock
+    ViLBlock,
+    ImageToSequence
 )
 from .conv import (
     CBAM,
