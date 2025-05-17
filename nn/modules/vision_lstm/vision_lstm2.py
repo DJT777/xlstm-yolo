@@ -132,6 +132,138 @@ def parallel_stabilized_simple(
 
     return h_tilde_state
 
+class ConvFeedForwardSOTA(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        # Parameters from ViLLayer's FeedForward call:
+        ffn_proj_factor: float, # This will be used as the expansion factor for the GELU FFN
+        ffn_round_up_to_multiple_of: int,
+        use_bias: bool, # Passed from ViLLayer's proj_bias
+        num_blocks: int,  # Passed from ViLLayer, used for wang_init_
+        weight_mode: str = None, # ACCEPTED from ViLLayer but IGNORED by this FFN type
+
+        # New parameters specific to this ConvFeedForwardSOTA, with SOTA defaults:
+        conv_kernel_size: int = 3,
+        add_inner_norm: bool = True, # Recommended SOTA addition
+    ):
+        super().__init__()
+        self.embedding_dim = embedding_dim
+        self.use_bias = use_bias # Respecting the value from ViLLayer
+        self.num_blocks_for_init = num_blocks # Using the passed value
+        self.add_inner_norm = add_inner_norm
+        # weight_mode is deliberately not stored or used as it's irrelevant here.
+
+        # --- Interpret ffn_proj_factor as the expansion factor for this GELU+Conv FFN ---
+        # The original FeedForward (GLU-based) might have used ffn_proj_factor (e.g., 2.667)
+        # to define the size of each of the two GLU branches.
+        # For this new GELU-based FFN (Linear -> DWConv -> GELU -> Linear),
+        # ffn_proj_factor will define the overall expansion. A typical value for
+        # GELU FFNs is 4.0. If ViLLayer passes 2.667, this FFN will have a
+        # hidden_dim = embedding_dim * 2.667, which is slimmer than a typical 4x.
+        # This is a design choice controlled by what ViLLayer passes.
+        _ffn_expansion_factor = ffn_proj_factor
+
+        hidden_dim_intermediate = int(embedding_dim * _ffn_expansion_factor)
+        self.hidden_dim = round_up_to_next_multiple_of(
+            hidden_dim_intermediate,
+            ffn_round_up_to_multiple_of,
+        )
+
+        # 1. Up-projection Linear Layer
+        self.proj_up = nn.Linear(
+            in_features=embedding_dim,
+            out_features=self.hidden_dim,
+            bias=use_bias,
+        )
+
+        # 2. Depth-wise 1D Convolution (applied sequence-wise)
+        self.dw_conv = nn.Conv1d(
+            in_channels=self.hidden_dim,
+            out_channels=self.hidden_dim,
+            kernel_size=conv_kernel_size,
+            padding=conv_kernel_size // 2,
+            groups=self.hidden_dim,
+            bias=use_bias,
+        )
+
+        # 3. Activation Function
+        self.act_fn = nn.GELU()
+
+        # 4. Optional Inner Normalization
+        if self.add_inner_norm:
+            self.inner_norm = nn.RMSNorm(self.hidden_dim, eps=1e-5)
+
+        # 5. Down-projection Linear Layer
+        self.proj_down = nn.Linear(
+            in_features=self.hidden_dim,
+            out_features=embedding_dim,
+            bias=use_bias,
+        )
+
+        self.reset_parameters()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_up = self.proj_up(x)
+        x_permuted = x_up.permute(0, 2, 1) # (B, N, H_dim) -> (B, H_dim, N)
+        x_conv_out = self.dw_conv(x_permuted)
+        x_after_conv = x_conv_out.permute(0, 2, 1) # (B, H_dim, N) -> (B, N, H_dim)
+        activated_x = self.act_fn(x_after_conv)
+
+        if self.add_inner_norm:
+            activated_x = self.inner_norm(activated_x)
+
+        y = self.proj_down(activated_x)
+        return y
+
+    def reset_parameters(self):
+        # Kaiming uniform for layers followed by GELU
+        nn.init.kaiming_uniform_(self.proj_up.weight, a=math.sqrt(5))
+        if self.proj_up.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.proj_up.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.proj_up.bias, -bound, bound)
+
+        nn.init.kaiming_uniform_(self.dw_conv.weight, a=math.sqrt(5))
+        if self.dw_conv.bias is not None:
+            # Simplified fan_in calculation for DWConv1d bias init
+            # True fan_in per output channel is kernel_size[0] since groups=in_channels
+            fan_in_per_group = self.dw_conv.kernel_size[0]
+            bound = 1 / math.sqrt(fan_in_per_group) if fan_in_per_group > 0 else 0
+            nn.init.uniform_(self.dw_conv.bias, -bound, bound)
+
+        wang_init_(
+            self.proj_down.weight,
+            input_dim_of_layer=self.hidden_dim,
+            num_total_blocks=self.num_blocks_for_init,
+        )
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
+
+
+
+
+class RGBlockVIL(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.,
+                 channels_first=False):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        hidden_features = int(2 * hidden_features / 3)
+        self.fc1 = nn.Conv2d(in_features, hidden_features * 2, kernel_size=1)
+        self.dwconv = nn.Conv2d(hidden_features, hidden_features, kernel_size=3, stride=1, padding=1, bias=True,
+                                groups=hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Conv2d(hidden_features, out_features, kernel_size=1)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x, v = self.fc1(x).chunk(2, dim=1)
+        x = self.act(self.dwconv(x) + x) * v
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
 
 class FeedForward(nn.Module):
     def __init__(
@@ -214,322 +346,7 @@ class FeedForward(nn.Module):
         if self.proj_down.bias is not None:
             nn.init.zeros_(self.proj_down.bias)
 
-#grok refactor no gated Z
-class ViLLayer(nn.Module):
-    def __init__(self,
-                 dim,
-                 direction,
-                 expansion=2,
-                 qkv_block_size=4,
-                 proj_bias=True,
-                 norm_bias=True,
-                 conv_bias=True,
-                 conv_kernel_size=3,
-                 conv_kind="2d",
-                 init_weights="original-fixed",
-                 seqlens=None,
-                 num_blocks=15,
-                 gate_soft_cap=15.0,
-                 ffn_proj_factor=2.6667,
-                 ffn_round_up_to_multiple_of=64,
-                 weight_mode="fused",
-                 chunk_size=64
-    ):
-        super().__init__()
-        assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
-        self.dim = dim
-        self.direction = direction
-        self.expansion = expansion
-        self.qkv_block_size = qkv_block_size
-        self.gate_soft_cap = gate_soft_cap
-        self.weight_mode = weight_mode
-        self.num_blocks = num_blocks
 
-        inner_dim = expansion * dim
-        num_heads = inner_dim // qkv_block_size
-        self.inner_dim = inner_dim
-        self.num_heads = num_heads
-
-        # Fused up projection for Q, K, V, adjusted to 2 * inner_dim
-        self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
-
-        # Convolution applied only to x_qk
-        if conv_kind == "causal1d":
-            self.conv = CausalConv1d(inner_dim, kernel_size=conv_kernel_size, bias=conv_bias)
-        elif conv_kind == "2d":
-            assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
-            self.conv = SequenceConv2d(
-                inner_dim, inner_dim, kernel_size=conv_kernel_size,
-                padding=conv_kernel_size // 2, groups=inner_dim,
-                bias=conv_bias, seqlens=seqlens
-            )
-        else:
-            raise NotImplementedError(f"conv_kind '{conv_kind}' is not supported")
-
-        # Separate projections for Q and K (from convolved x_qk) and V (from x_v)
-        self.qk_proj = nn.Linear(inner_dim, 2 * inner_dim, bias=proj_bias)
-        self.v_proj = nn.Linear(inner_dim, inner_dim, bias=proj_bias)
-
-        # MatrixLSTMCell with fused ifgate and soft capping
-        self.mlstm_cell = MatrixLSTMCell(
-            dim=inner_dim,
-            num_heads=num_heads,
-            norm_bias=norm_bias,
-            eps=1e-5,
-            chunk_size=chunk_size,
-            gate_soft_cap=gate_soft_cap
-        )
-
-        self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
-        self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
-
-        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-        # FFN with its own normalization
-        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-        self.ffn = FeedForward(
-            embedding_dim=dim,
-            ffn_proj_factor=ffn_proj_factor,
-            ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
-            use_bias=proj_bias,
-            weight_mode=weight_mode,
-            num_blocks=num_blocks or 1,
-        )
-
-        self.reset_parameters()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.norm(x)
-
-        # Handle sequence direction
-        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
-            x = x.flip(dims=[1])
-
-        # Fused up projection for Q, K, V
-        x_inner = self.proj_up(x)  # (B, S, 2 * inner_dim)
-        x_qk, x_v = torch.chunk(x_inner, 2, dim=-1)  # Each (B, S, inner_dim)
-
-        # Convolution on x_qk only
-        x_qk_conv_act = F.silu(self.conv(x_qk))  # (B, S, inner_dim)
-
-        # Project to Q and K, and V separately
-        qk = self.qk_proj(x_qk_conv_act)  # (B, S, 2 * inner_dim)
-        q, k = torch.chunk(qk, 2, dim=-1)  # Each (B, S, inner_dim)
-        v = self.v_proj(x_v)  # (B, S, inner_dim)
-
-        # Reshape for multi-head processing
-        B, S, _ = q.shape
-        # q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
-        # k = k.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
-        # v = v.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
-
-        # mLSTM processing
-        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)  # (B, S, inner_dim)
-        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_qk_conv_act)  # (B, S, inner_dim)
-        x_mlstm = self.proj_down(h_tilde_state_skip)  # (B, S, dim)
-
-        # Revert sequence direction if needed
-        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
-            x_mlstm = x_mlstm.flip(dims=[1])
-
-        # Residual connection after mLSTM
-        x = residual + x_mlstm
-
-        # FFN with residual connection
-        ffn_residual = x
-        x_ffn = self.ffn_norm(x)
-        x_ffn = self.ffn(x_ffn)
-        x = ffn_residual + x_ffn
-
-        return x
-
-    def reset_parameters(self):
-        # Initialize weights as per original conventions
-        small_init_(self.proj_up.weight, self.dim)
-        if self.proj_up.bias is not None:
-            nn.init.zeros_(self.proj_up.bias)
-
-        small_init_(self.qk_proj.weight, self.dim)
-        if self.qk_proj.bias is not None:
-            nn.init.zeros_(self.qk_proj.bias)
-
-        small_init_(self.v_proj.weight, self.dim)
-        if self.v_proj.bias is not None:
-            nn.init.zeros_(self.v_proj.bias)
-
-        wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
-        if self.proj_down.bias is not None:
-            nn.init.zeros_(self.proj_down.bias)
-
-        nn.init.ones_(self.learnable_skip)
-        self.mlstm_cell.reset_parameters()
-        self.norm.reset_parameters()
-        self.ffn_norm.reset_parameters()
-        self.ffn.reset_parameters()
-
-
-#gpt 4.5
-# class ViLLayer(nn.Module):
-#     def __init__(self,
-#             dim,
-#             direction,
-#             expansion=2,
-#             qkv_block_size=4,
-#             proj_bias=True,
-#             norm_bias=True,
-#             conv_bias=True,
-#             conv_kernel_size=3,
-#             conv_kind="2d",
-#             init_weights="original-fixed",
-#             seqlens=None,
-#             num_blocks=15,
-#             gate_soft_cap=15.0,
-#             ffn_proj_factor=2.6667,
-#             ffn_round_up_to_multiple_of=64,
-#             weight_mode="fused",
-#             chunk_size=64
-#     ):
-#         super().__init__()
-#         #print(chunk_size)
-#         assert dim % qkv_block_size == 0
-#         self.dim = dim
-#         self.direction = direction
-#         self.expansion = expansion
-#         self.qkv_block_size = qkv_block_size
-#         self.gate_soft_cap = gate_soft_cap
-#         self.weight_mode = weight_mode
-#         self.num_blocks = num_blocks
-
-#         inner_dim = expansion * dim
-#         num_heads = inner_dim // qkv_block_size
-#         self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
-#         # self.qkv_proj = nn.Linear(inner_dim, 3 * inner_dim, bias=proj_bias)
-        
-#         self.q_proj = LinearHeadwiseExpand(
-#             dim=inner_dim,
-#             num_heads=num_heads,
-#             bias=proj_bias,
-#         )
-#         self.k_proj = LinearHeadwiseExpand(
-#             dim=inner_dim,
-#             num_heads=num_heads,
-#             bias=proj_bias,
-#         )
-#         self.v_proj = LinearHeadwiseExpand(
-#             dim=inner_dim,
-#             num_heads=num_heads,
-#             bias=proj_bias,
-#         )
-
-#         if conv_kind == "causal1d":
-#             self.conv = CausalConv1d(inner_dim, kernel_size=conv_kernel_size, bias=conv_bias)
-#         elif conv_kind == "2d":
-#             assert conv_kernel_size % 2 == 1
-#             self.conv = SequenceConv2d(
-#                 inner_dim, inner_dim, kernel_size=conv_kernel_size,
-#                 padding=conv_kernel_size // 2, groups=inner_dim,
-#                 bias=conv_bias, seqlens=seqlens
-#             )
-#         else:
-#             raise NotImplementedError
-
-#         self.mlstm_cell = MatrixLSTMCell(
-#             dim=inner_dim,
-#             num_heads=num_heads,
-#             norm_bias=norm_bias,
-#             eps=1e-5,
-#             chunk_size=chunk_size
-#         )
-
-#         self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
-#         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
-
-#         self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-#         # self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
-
-#         # self.ffn = FeedForward(
-#         #     embedding_dim=dim,
-#         #     ffn_proj_factor=ffn_proj_factor,
-#         #     ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
-#         #     use_bias=proj_bias,
-#         #     weight_mode=weight_mode,
-#         #     num_blocks=num_blocks or 1,
-#         # )
-
-#         self.reset_parameters()
-
-#     def forward(self, x: torch.Tensor) -> torch.Tensor:
-#         residual = x
-#         x = self.norm(x)
-
-#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
-#             x = x.flip(dims=[1])
-
-#         x_inner = self.proj_up(x)
-#         x_mlstm, z = torch.chunk(x_inner, 2, dim=-1)
-
-#         x_mlstm_conv_act = F.silu(self.conv(x_mlstm))
-
-#         # fused QKV projections
-#         # qkv = self.qkv_proj(x_mlstm_conv_act)
-#         # q, k, v = torch.chunk(qkv, 3, dim=-1)
-#         q = self.q_proj(x_mlstm_conv_act)
-#         k = self.k_proj(x_mlstm_conv_act)
-#         v = self.v_proj(x_mlstm)
-
-#         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
-#         h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_mlstm_conv_act)
-
-#         h_state = h_tilde_state_skip * F.silu(z)
-
-#         x = self.proj_down(h_state)
-
-#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
-#             x = x.flip(dims=[1])
-
-#         x = residual + x
-
-#         # # FFN with residual
-#         # ffn_residual = x
-#         # x_ffn = self.ffn_norm(x)
-#         # x_ffn = self.ffn(x_ffn)
-#         # x = ffn_residual + x_ffn
-
-#         return x
-
-#     def reset_parameters(self):
-#         small_init_(self.proj_up.weight, self.dim)
-#         if self.proj_up.bias is not None:
-#             nn.init.zeros_(self.proj_up.bias)
-
-#         # small_init_(self.qkv_proj.weight, self.dim)
-#         # if self.qkv_proj.bias is not None:
-#         #     nn.init.zeros_(self.qkv_proj.bias)
-
-#         wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
-#         if self.proj_down.bias is not None:
-#             nn.init.zeros_(self.proj_down.bias)
-
-#         nn.init.ones_(self.learnable_skip)
-#         self.mlstm_cell.reset_parameters()
-#         self.norm.reset_parameters()
-
-
-#         def _init_qkv_proj(qkv_proj: LinearHeadwiseExpand):
-#             # use the embedding dim instead of the inner embedding dim
-#             small_init_(qkv_proj.weight, dim=self.dim)
-#             if qkv_proj.bias is not None:
-#                 nn.init.zeros_(qkv_proj.bias)
-
-
-#         _init_qkv_proj(self.q_proj)
-#         _init_qkv_proj(self.k_proj)
-#         _init_qkv_proj(self.v_proj)
-
-#         # self.ffn_norm.reset_parameters()
-#         # self.ffn.reset_parameters()
-
-#
 
 #GPT 4.5 refactor
 class ViLBlock(nn.Module):
@@ -554,8 +371,8 @@ class ViLBlock(nn.Module):
         self.drop_path = drop_path
         self.norm_bias = norm_bias
 
-        self.drop_path = DropPath(drop_prob=0.0)
-        self.norm = nn.RMSNorm(dim, eps=1e-3)
+        #self.drop_path = DropPath(drop_prob=0.0)
+        #self.norm = nn.RMSNorm(dim, eps=1e-3)
         self.layer = ViLLayer(dim,
                                 direction,
                                 qkv_block_size=qkv_block_size,
@@ -565,7 +382,7 @@ class ViLBlock(nn.Module):
                                 conv_kernel_size=3,
                                 conv_kind="2d",
                                 init_weights="original",
-                                seqlens=None,  # Initial seqlens, can be overridden in forward
+                                seqlens=seqlens,  # Initial seqlens, can be overridden in forward
                                 num_blocks=None,
                                 chunk_size=chunk_size,
                             )
@@ -584,85 +401,408 @@ class ViLBlock(nn.Module):
 
     def reset_parameters(self):
         self.layer.reset_parameters()
-        self.norm.reset_parameters()
+        #self.norm.reset_parameters()
 
-# #original mlstm
-
-# class MatrixLSTMCell(nn.Module):
-#     def __init__(self, dim, num_heads, norm_bias=True):
+# #grok refactor no gated Z
+# class ViLLayer(nn.Module):
+#     def __init__(self,
+#                  dim,
+#                  direction,
+#                  qkv_block_size=4,
+#                  proj_bias=True,
+#                  norm_bias=True,
+#                  conv_bias=True,
+#                  conv_kernel_size=3,
+#                  conv_kind="2d",
+#                  init_weights="original-fixed",
+#                  seqlens=None,
+#                  num_blocks=12,
+#                  gate_soft_cap=15.0,
+#                  ffn_proj_factor=2.6667,
+#                  ffn_round_up_to_multiple_of=64,
+#                  weight_mode="fused",
+#                  chunk_size=64
+#     ):
 #         super().__init__()
+#         assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
 #         self.dim = dim
-#         self.num_heads = num_heads
+#         self.direction = direction
+#         self.qkv_block_size = qkv_block_size
+#         self.gate_soft_cap = gate_soft_cap
+#         self.weight_mode = weight_mode
+#         self.num_blocks = num_blocks
 
-#         self.igate = nn.Linear(3 * dim, num_heads)
-#         self.fgate = nn.Linear(3 * dim, num_heads)
-#         self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias)
-#         self.causal_mask_cache = {}
+#         # Compute dimensions
+#         num_heads = dim // qkv_block_size
+#         self.num_heads = num_heads
+#         self.DHQK = int(qkv_block_size)
+#         self.DHHV = qkv_block_size * 2 # Set DHHV equal to DHQK
+
+#         # Convolution applied to input x
+#         if conv_kind == "causal1d":
+#             self.conv = CausalConv1d(dim, kernel_size=conv_kernel_size, bias=conv_bias)
+#         elif conv_kind == "2d":
+#             assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
+#             self.conv = SequenceConv2d(
+#                 dim, dim, kernel_size=conv_kernel_size,
+#                 padding=conv_kernel_size // 2, groups=dim,
+#                 bias=conv_bias, seqlens=seqlens
+#             )
+#         else:
+#             raise NotImplementedError(f"conv_kind '{conv_kind}' is not supported")
+
+#         # Fused projection for Q and K
+#         self.qk_proj = nn.Linear(dim, 2 * dim, bias=proj_bias)
+#         # Separate projection for V
+#         self.v_proj = nn.Linear(dim, 2 * dim, bias=proj_bias)
+
+#         # mLSTM cell
+#         self.mlstm_cell = MatrixLSTMCell(
+#             dim=dim,
+#             num_heads=num_heads,
+#             norm_bias=norm_bias,
+#             eps=1e-5,
+#             chunk_size=chunk_size,
+#             gate_soft_cap=gate_soft_cap,
+#             DHQK=self.DHQK,
+#             DHHV=self.DHHV
+#         )
+
+#         # Output projection
+#         self.out_proj = nn.Linear(2 * dim, dim, bias=proj_bias)
+
+#         self.learnable_skip = nn.Parameter(torch.ones(dim))
+#         #self.proj_down = nn.Linear(dim, dim, bias=proj_bias)
+
+#         self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+
+#         if seqlens[0] < 128:
+#             self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#             # self.ffn = ConvFeedForwardSOTA( # Use the new FFN class
+#             #     embedding_dim=dim,
+#             #     ffn_proj_factor=ffn_proj_factor, # Passed from ViLLayer
+#             #     ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of, # Passed
+#             #     use_bias=proj_bias, # Passed
+#             #     num_blocks=num_blocks or 1, # Passed
+#             #     weight_mode=weight_mode, # Passed (and will be ignored by ConvFeedForwardSOTA)
+#             #     # conv_kernel_size and add_inner_norm will use their defaults in ConvFeedForwardSOTA
+#             #     # unless you modify ViLLayer to pass them too.
+#             # )
+#             self.ffn = FeedForward(
+#                 embedding_dim=dim,
+#                 ffn_proj_factor=ffn_proj_factor,
+#                 ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+#                 use_bias=proj_bias,
+#                 weight_mode=weight_mode,
+#                 num_blocks=num_blocks or 1,
+#             )
+#         else:
+#             self.ffn = None
+
 #         self.reset_parameters()
 
-#     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-#         B, S, _ = q.shape  # (B, S, H)
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         residual = x  # (B, S, dim)
+#         x = self.norm(x)
 
-#         if_gate_input = torch.cat([q, k, v], dim=-1)
-#         q = q.view(B, S, self.num_heads, -1)  # (B, S, NH, DH)
-#         k = k.view(B, S, self.num_heads, -1)  # (B, S, NH, DH)
-#         v = v.view(B, S, self.num_heads, -1)  # (B, S, NH, DH)
+#         # Handle sequence direction
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             x = x.flip(dims=[1])
 
-#         q = q.transpose(1, 2)  # (B, NH, S, DH)
-#         k = k.transpose(1, 2)  # (B, NH, S, DH)
-#         v = v.transpose(1, 2)  # (B, NH, S, DH)
+#         # Convolution on input x
+#         x_conv_act = F.silu(self.conv(x))  # (B, S, dim)
 
-#         # compute input and forget gate pre-activations
-#         igate_preact = self.igate(if_gate_input)  # (B, S, NH)
-#         igate_preact = igate_preact.transpose(-1, -2).unsqueeze(-1)  # (B, NH, S, 1)
-#         fgate_preact = self.fgate(if_gate_input)  # (B, S, NH)
-#         fgate_preact = fgate_preact.transpose(-1, -2).unsqueeze(-1)  # (B, NH, S, 1)#
+#         # Compute fused QK and V
+#         qk = self.qk_proj(x_conv_act)  # (B, S, 2 * dim)
+#         q, k = torch.chunk(qk, 2, dim=-1)  # Each (B, S, dim)
+#         v = self.v_proj(x)  # (B, S, dim)
 
-#         # cache causal mask to avoid memory allocation in every iteration
-#         if S in self.causal_mask_cache:
-#             causal_mask = self.causal_mask_cache[(S, str(q.device))]
+#         # mLSTM processing
+#         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)  # (B, NH, S, DHHV)
+#         h_tilde_state = h_tilde_state.transpose(1, 2).contiguous()  # (B, S, NH, DHHV)
+#         h_tilde_state = h_tilde_state.view(x.shape[0], x.shape[1], -1)  # (B, S, dim)
+#         h_tilde_state = self.out_proj(h_tilde_state)  # (B, S, dim)
+
+#         # Skip connection with convolved input
+#         x_mlstm = h_tilde_state + (self.learnable_skip * x_conv_act)  # (B, S, dim)
+        
+#         #x_mlstm = self.proj_down(h_tilde_state_skip)  # (B, S, dim)
+
+#         # Revert sequence direction if needed
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             x_mlstm = x_mlstm.flip(dims=[1])
+
+#         # Residual connection after mLSTM
+#         x = residual + x_mlstm
+
+#         if self.ffn:
+#             # print("MLP PASS")
+#             # FFN with residual connection
+#             ffn_residual = x
+#             x_ffn = self.ffn_norm(x)
+#             x_ffn = self.ffn(x_ffn)  # FFN handles up-projection here
+#             x = ffn_residual + x_ffn
+
+#             return x
 #         else:
-#             causal_mask = torch.tril(torch.ones(S, S, dtype=torch.bool, device=q.device))
-#             self.causal_mask_cache[(S, str(q.device))] = causal_mask
-
-#         h_state = parallel_stabilized_simple(
-#             queries=q,
-#             keys=k,
-#             values=v,
-#             igate_preact=igate_preact,
-#             fgate_preact=fgate_preact,
-#             lower_triangular_matrix=causal_mask,
-#         )  # (B, NH, S, DH)
-
-#         h_state_norm = self.outnorm(h_state)  # (B, NH, S, DH)
-#         h_state_norm = h_state_norm.transpose(1, 2).reshape(B, S, -1)  # (B, NH, S, DH) -> (B, S, NH, DH) -> (B, S, H)
-
-#         return h_state_norm
+#             # print("NO MLP PASS")
+#             return x
 
 #     def reset_parameters(self):
-#         self.outnorm.reset_parameters()
-#         # forget gate initialization
-#         torch.nn.init.zeros_(self.fgate.weight)
-#         bias_linspace_init_(self.fgate.bias, start=3.0, end=6.0)
-#         # input gate initialization
-#         torch.nn.init.zeros_(self.igate.weight)
-#         torch.nn.init.normal_(self.igate.bias, mean=0.0, std=0.1)
+#         # Placeholder initialization functions (replace with actual implementations)
+#         def small_init_(tensor, dim): torch.nn.init.normal_(tensor, std=0.02)
+#         def wang_init_(tensor, dim, num_blocks): torch.nn.init.normal_(tensor, std=0.02)
+
+#         small_init_(self.qk_proj.weight, self.dim)
+#         if self.qk_proj.bias is not None:
+#             nn.init.zeros_(self.qk_proj.bias)
+
+#         # small_init_(self.v_proj.weight, self.dim)
+#         # if self.v_proj.bias is not None:
+#         #     nn.init.zeros_(self.v_proj.bias)
+
+#         # small_init_(self.out_proj.weight, self.dim)
+#         # if self.out_proj.bias is not None:
+#         #     nn.init.zeros_(self.out_proj.bias)
+
+#         # wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
+#         # if self.proj_down.bias is not None:
+#         #     nn.init.zeros_(self.proj_down.bias)
+
+#         nn.init.ones_(self.learnable_skip)
+#         self.mlstm_cell.reset_parameters()
+#         self.norm.reset_parameters()
+#         if self.ffn:
+#             self.ffn_norm.reset_parameters()
+#             self.ffn.reset_parameters()
+
+
+class ViLLayer(nn.Module):
+    def __init__(self,
+                 dim,
+                 direction, # Should be a value from SequenceTraversal Enum
+                 qkv_block_size=4,
+                 proj_bias=True,
+                 norm_bias=True, # Corresponds to elementwise_affine in RMSNorm
+                 conv_bias=True,
+                 conv_kernel_size=3,
+                 conv_kind="2d",
+                 init_weights="original-fixed", # This parameter is not directly used in the provided snippet
+                 seqlens=None, # Expected to be [H, W] for 2D conv and RGBlock FFN
+                 num_blocks=12, # Potentially for MatrixLSTMCell or other components
+                 gate_soft_cap=15.0,
+                 ffn_proj_factor=2.6667, # Unused if FFN is RGBlock
+                 ffn_round_up_to_multiple_of=64, # Unused if FFN is RGBlock
+                 ffn_drop=0.0, # Dropout rate for the RGBlock FFN
+                 act_layer_ffn=nn.SiLU, # Activation function for the RGBlock FFN
+                 weight_mode="fused", # Unused if FFN is RGBlock
+                 chunk_size=64 # Parameter for MatrixLSTMCell
+    ):
+        super().__init__()
+        assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+        self.dim = dim
+        self.direction = direction
+        self.gate_soft_cap = gate_soft_cap
+        # self.qkv_block_size = qkv_block_size # Stored as DHQK essentially
+        # self.weight_mode = weight_mode # Not used by RGBlock path
+        # self.num_blocks = num_blocks # Not directly used by ViLLayer's own logic here
+
+        # Compute dimensions for the attention-like mechanism (mLSTM)
+        num_heads = dim // qkv_block_size
+        self.num_heads = num_heads
+        self.DHQK = int(qkv_block_size) # Dimension per head for Q, K
+        self.DHHV = qkv_block_size * 2  # Dimension per head for V
+
+        # Convolutional layer applied to the input x
+        if conv_kind == "causal1d":
+            self.conv = CausalConv1d(dim, dim, kernel_size=conv_kernel_size, bias=conv_bias)
+        elif conv_kind == "2d":
+            assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
+            self.conv = SequenceConv2d(
+                in_channels=dim, 
+                out_channels=dim, 
+                kernel_size=conv_kernel_size,
+                padding=conv_kernel_size // 2, 
+                groups=dim, # Assuming depthwise-like convolution
+                bias=conv_bias, 
+                seqlens=seqlens
+            )
+        else:
+            raise NotImplementedError(f"conv_kind '{conv_kind}' is not supported")
+
+        # Linear projection for Q (Query) and K (Key)
+        self.qk_proj = nn.Linear(dim, 2 * dim, bias=proj_bias)
+        # Linear projection for V (Value)
+        self.v_proj = nn.Linear(dim, 2 * dim, bias=proj_bias) # Outputting 2*dim for V
+
+        # MatrixLSTM cell
+        self.mlstm_cell = MatrixLSTMCell(
+            dim=dim, # Input dimension to the cell (q, k, v are projected to this)
+            num_heads=num_heads,
+            norm_bias=norm_bias, # Bias for normalization layers within the cell
+            eps=1e-5,            # Epsilon for normalization
+            chunk_size=chunk_size,
+            gate_soft_cap=gate_soft_cap,
+            DHQK=self.DHQK,
+            DHHV=self.DHHV
+        )
+
+        # Output projection layer for the mLSTM part
+        # Input to this layer is num_heads * DHHV
+        self.out_proj = nn.Linear(2 * dim, dim, bias=proj_bias)
+
+        # Learnable skip connection parameter
+        self.learnable_skip = nn.Parameter(torch.ones(dim))
+        
+        # Normalization layer (RMSNorm) for the main input
+        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+
+        # Feed-Forward Network (FFN) part, using RGBlock
+        self.ffn = None
+        self.ffn_norm = None
+        self._ffn_grid_h, self._ffn_grid_w = None, None # Store grid dimensions for FFN
+
+        # Initialize FFN if seqlens are provided and meet the condition
+        if seqlens is not None and len(seqlens) == 2:
+            h_for_ffn, w_for_ffn = seqlens[0], seqlens[1]
+            # Condition to add FFN (e.g., if sequence height isn't too large)
+            if h_for_ffn < 128: # Example condition from original code
+                self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+                self.ffn = RGBlockVIL(
+                    in_features=dim,
+                    # hidden_features for RGBlock defaults to in_features, 
+                    # then RGBlock calculates its internal hidden dimension.
+                    out_features=dim,
+                    act_layer=act_layer_ffn, # Use parameterized activation (e.g., nn.SiLU)
+                    drop=ffn_drop             # Use parameterized dropout
+                )
+                self._ffn_grid_h = h_for_ffn
+                self._ffn_grid_w = w_for_ffn
+                # Note: ffn_proj_factor, ffn_round_up_to_multiple_of, weight_mode,
+                # and num_blocks (for FFN context) are not used by RGBlock.
+        
+        self.reset_parameters() # Call this if a custom reset_parameters method is defined
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Input x shape: (Batch, SequenceLength, Dimension)
+        residual = x  # Store original input for the main residual connection
+        
+        # Normalize input
+        x_norm = self.norm(x)
+
+        # Handle sequence traversal direction
+        current_x = x_norm
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            current_x = current_x.flip(dims=[1]) # Flip along the sequence dimension
+
+        # Apply convolution
+        # self.conv expects (B, S, C) input
+        x_conv_act = F.silu(self.conv(current_x)) # Apply SiLU activation to convolved output
+
+        # Project to Q, K, V
+        # qk_proj input is the activated convolved output
+        qk = self.qk_proj(x_conv_act)  # Shape: (B, S, 2 * dim)
+        q, k = torch.chunk(qk, 2, dim=-1)  # Each q, k shape: (B, S, dim)
+        
+        # v_proj input: using `current_x` (normalized, potentially flipped input)
+        v = self.v_proj(current_x) # Shape: (B, S, 2 * dim)
+
+        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)  # Expected output: (B, NumHeads, S, DHHV)
+        
+        # Transpose and reshape mLSTM output
+        h_tilde_state = h_tilde_state.transpose(1, 2).contiguous()  # Shape: (B, S, NumHeads, DHHV)
+        h_tilde_state = h_tilde_state.reshape(x.shape[0], x.shape[1], -1) # Shape: (B, S, NumHeads*DHHV)
+        
+        # Project mLSTM output back to original dimension
+        h_tilde_state = self.out_proj(h_tilde_state)  # Shape: (B, S, dim)
+
+        # Skip connection with the convolved and activated input
+        x_mlstm = h_tilde_state + (self.learnable_skip * x_conv_act)
+
+        # Revert sequence direction if it was flipped
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            x_mlstm = x_mlstm.flip(dims=[1])
+
+        # Main residual connection after the mLSTM block
+        x_after_mlstm = residual + x_mlstm
+
+        # Apply Feed-Forward Network (FFN) if it's defined
+        if self.ffn and self.ffn_norm:
+            ffn_residual = x_after_mlstm # Residual for the FFN block
+            x_for_ffn = self.ffn_norm(x_after_mlstm) # Normalize input to FFN, shape (B, S, D)
+
+            B, S, D_ffn = x_for_ffn.shape
+            H_grid, W_grid = self._ffn_grid_h, self._ffn_grid_w
+
+            # Validate dimensions for reshaping, if grid dimensions are set
+            if H_grid is None or W_grid is None:
+                 raise ValueError("FFN grid dimensions (H,W) are not set, but FFN is active.")
+            if S != H_grid * W_grid:
+                raise ValueError(f"Sequence length {S} for FFN input "
+                                 f"does not match H*W ({H_grid}*{W_grid}) from seqlens.")
+
+            # Reshape for RGBlock (which expects 2D Conv input format)
+            # (B, S, D) -> (B, D, S) -> (B, D, H, W)
+            x_ffn_reshaped = x_for_ffn.permute(0, 2, 1).reshape(B, D_ffn, H_grid, W_grid)
+            
+            x_output_rgblock = self.ffn(x_ffn_reshaped) # RGBlock processes (B, D, H, W)
+
+            # Reshape back to sequence format
+            # (B, D, H, W) -> (B, D, S) -> (B, S, D)
+            x_ffn_processed = x_output_rgblock.reshape(B, D_ffn, S).permute(0, 2, 1)
+
+            # Add FFN residual
+            x_final = ffn_residual + x_ffn_processed
+            return x_final
+        else:
+            # If no FFN, return the output from mLSTM block
+            return x_after_mlstm
+        
+    def reset_parameters(self):
+        # Placeholder initialization functions (replace with actual implementations)
+        def small_init_(tensor, dim): torch.nn.init.normal_(tensor, std=0.02)
+        def wang_init_(tensor, dim, num_blocks): torch.nn.init.normal_(tensor, std=0.02)
+
+        small_init_(self.qk_proj.weight, self.dim)
+        if self.qk_proj.bias is not None:
+            nn.init.zeros_(self.qk_proj.bias)
+
+        # small_init_(self.v_proj.weight, self.dim)
+        # if self.v_proj.bias is not None:
+        #     nn.init.zeros_(self.v_proj.bias)
+
+        # small_init_(self.out_proj.weight, self.dim)
+        # if self.out_proj.bias is not None:
+        #     nn.init.zeros_(self.out_proj.bias)
+
+        # wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
+        # if self.proj_down.bias is not None:
+        #     nn.init.zeros_(self.proj_down.bias)
+
+        nn.init.ones_(self.learnable_skip)
+        self.mlstm_cell.reset_parameters()
+        self.norm.reset_parameters()
+        if self.ffn:
+            self.ffn_norm.reset_parameters()
+            # self.ffn.reset_parameters()
 
 #grok backendsclass 
 from mlstm_kernels.torch.chunkwise.triton_xl_chunk import mlstm_chunkwise__xl_chunk
 class MatrixLSTMCell(nn.Module):
-    def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float16, gate_soft_cap=15.0):
+    def __init__(self, dim, num_heads, norm_bias=True, eps=1e-6, chunk_size=16, use_autocast=True, autocast_dtype=torch.float16, gate_soft_cap=15.0, DHHV=None, DHQK=None):
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.use_autocast = use_autocast
         self.autocast_dtype = autocast_dtype
         self.gate_soft_cap = gate_soft_cap  # Cap value for soft capping
+        self.DHHV = DHHV
+        self.DHQK = DHQK
 
         # Fused ifgate projection
-        self.ifgate = nn.Linear(3 * dim, 2 * num_heads)
+        self.ifgate = nn.Linear(4 * dim, 2 * num_heads)
 
-        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-3)
+        self.outnorm = MultiHeadLayerNorm(ndim=num_heads*DHHV, weight=True, bias=norm_bias, eps=1e-6)
         self.causal_mask_cache = {}
         self.chunk_size = chunk_size
 
@@ -674,7 +814,7 @@ class MatrixLSTMCell(nn.Module):
             chunk_size=int(chunk_size),
             autocast_kernel_dtype="float16",
             return_last_states=False,
-            mode="inference",
+            mode="train_with_padding",
             eps=5e-5
         )
         self.cpu_backend_infer = mLSTMBackend(
@@ -689,7 +829,7 @@ class MatrixLSTMCell(nn.Module):
             chunk_size=int(chunk_size),
             autocast_kernel_dtype="float16",
             return_last_states=False,
-            mode="inference",
+            mode="train_with_padding",
             eps=5e-5
         )
         self.gpu_backend_infer = mLSTMBackend(
@@ -704,7 +844,7 @@ class MatrixLSTMCell(nn.Module):
             chunk_size=int(chunk_size),
             autocast_kernel_dtype="float16",
             return_last_states=False,
-            mode="train",
+            mode="train_with_padding",
             eps=5e-5
         )
         self.cpu_backend = mLSTMBackend(
@@ -719,7 +859,7 @@ class MatrixLSTMCell(nn.Module):
             chunk_size=int(chunk_size),
             autocast_kernel_dtype="float16",
             return_last_states=False,
-            mode="train",
+            mode="train_with_padding",
             eps=5e-5
         )
         self.gpu_backend = mLSTMBackend(
@@ -752,9 +892,10 @@ class MatrixLSTMCell(nn.Module):
         f = f_preact.transpose(-1, -2)  # (B, NH, S)
 
         # Reshape for backend
-        q = q.view(B, S, self.num_heads, -1).transpose(1, 2)  # (B, NH, S, head_dim)
-        k = k.view(B, S, self.num_heads, -1).transpose(1, 2)
-        v = v.view(B, S, self.num_heads, -1).transpose(1, 2)
+        q = q.view(B, S, self.num_heads, self.DHQK).transpose(1, 2)  # (B, NH, S, DHQK)
+        k = k.view(B, S, self.num_heads, self.DHQK).transpose(1, 2)  # (B, NH, S, DHQK)
+        v = v.view(B, S, self.num_heads, self.DHHV).transpose(1, 2)  # (B, NH, S, DHHV)
+
 
         # Compute h_state with the selected backend, applying autocast if specified
         if device.type == 'cuda' and self.use_autocast and self.training:

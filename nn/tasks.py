@@ -80,7 +80,8 @@ from ultralytics.nn.modules import (
     PermuteBlock,
     FlattenPosEmbedBlock,
     PatchMerging,
-    ViLBlock
+    ViLBlock,
+    SimpleStem
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -351,7 +352,7 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 512 # 2x min stride
+            s = 640 # 2x min stride
             m.inplace = self.inplace
 
             def _forward(x):
