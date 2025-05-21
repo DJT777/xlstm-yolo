@@ -80,7 +80,9 @@ from ultralytics.nn.modules import (
     PermuteBlock,
     FlattenPosEmbedBlock,
     PatchMerging,
-    ViLBlock
+    ViLBlock,
+    SimpleStem,
+    ViLBasedRTDETRHead
 )
 from ultralytics.utils import DEFAULT_CFG_DICT, DEFAULT_CFG_KEYS, LOGGER, colorstr, emojis, yaml_load
 from ultralytics.utils.checks import check_requirements, check_suffix, check_yaml
@@ -351,7 +353,7 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 512 # 2x min stride
+            s = 256 # 2x min stride
             m.inplace = self.inplace
 
             def _forward(x):
@@ -1249,8 +1251,10 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 # print("DETECT ARGS")
                 # print(args)
                 m.legacy = legacy
-        elif m is RTDETRDecoder:  # Channels arg passed in index 1
+        elif m in {RTDETRDecoder}:  # Channels arg passed in index 1
             args.insert(1, [ch[x] for x in f])
+        elif m in {ViLBasedRTDETRHead}:  # Channels arg passed in index 1
+            args.insert(0, [ch[x] for x in f])
         elif m is CBLinear:
             c2 = args[0]
             c1 = ch[f]

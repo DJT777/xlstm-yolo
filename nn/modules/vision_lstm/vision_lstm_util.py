@@ -7,6 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+import torch.utils.checkpoint as cp
 
 
 # adapted from timm (timm/models/layers/helpers.py)
@@ -93,24 +94,34 @@ def get_sincos_pos_embed_from_grid(grid, dim: int, max_wavelength: int = 10000):
 
 
 # SequenceConv2d (unchanged from original)
-class SequenceConv2d(nn.Conv2d):
-    def __init__(self, *args, seqlens=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.seqlens = seqlens
+class SequenceConv2d(nn.Module):
+    """
+    A 2D convolution layer applied to a sequence representing a flattened 2D grid.
+    
+    Args:
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+        kernel_size (int or tuple): Size of the convolution kernel.
+        padding (int or tuple): Padding for the convolution.
+        groups (int): Number of groups in the convolution.
+        bias (bool): Whether to include a bias term.
+        seqlens (list or tuple): [H, W] where H and W are the height and width of the grid.
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, padding, groups, bias, seqlens):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, padding=padding, groups=groups, bias=bias)
+        self.seqlens = seqlens  # [H, W]
 
     def forward(self, x):
-        assert x.ndim == 3
-        if self.seqlens is None:
-            h = math.sqrt(x.size(1))
-            assert h.is_integer()
-            h = int(h)
-        else:
-            assert len(self.seqlens) == 2
-            h = self.seqlens[0]
-        x = einops.rearrange(x, "b (h w) d -> b d h w", h=h)
-        x = super().forward(x)
-        x = einops.rearrange(x, "b d h w -> b (h w) d")
-        return x
+        # Input: (B, S, C) where S = H * W
+        B, S, C = x.shape
+        H, W = self.seqlens
+        if S != H * W:
+            raise ValueError(f"Sequence length {S} does not match H*W ({H}*{W})")
+        x = x.permute(0, 2, 1).reshape(B, C, H, W)  # (B, C, H, W)
+        x = self.conv(x)
+        return x.reshape(B, C, S).permute(0, 2, 1)  # (B, S, C)
+
 
 
 # New SequenceConv3d for 3D sequences
@@ -136,6 +147,7 @@ class SequenceConv3d(nn.Conv3d):
 
 
 # VitPatchEmbed (unchanged from original, supports 3D)
+
 class VitPatchEmbed(nn.Module):
     def __init__(self, dim, num_channels, resolution, patch_size, stride=None, init_weights="xavier_uniform"):
         super().__init__()
@@ -191,12 +203,22 @@ class VitPatchEmbed(nn.Module):
             raise NotImplementedError
 
     def forward(self, x):
+        # Calculate number of patches (sequence length)
+        seq_len = int(np.prod([x.size(i + 2) // self.patch_size[i] for i in range(self.ndim)]))
+        need_ckpt = self.training and x.requires_grad and seq_len >= 6400  # 80^2
+
+        if need_ckpt:
+            return cp.checkpoint(self._forward_impl, x, use_reentrant=False)
+        else:
+            return self._forward_impl(x)
+
+    def _forward_impl(self, x):
         assert all(x.size(i + 2) % self.patch_size[i] == 0 for i in range(self.ndim)), \
             f"x.shape={x.shape} incompatible with patch_size={self.patch_size}"
         x = self.proj(x)
         x = einops.rearrange(x, "b c ... -> b ... c")
         return x
-    
+
     @torch.jit.ignore
     def no_weight_decay(self):
         """
@@ -222,6 +244,12 @@ class VitPosEmbed(nn.Module):
         self.is_learnable = is_learnable
         self.allow_interpolation = allow_interpolation
         self.interpolate_offset = interpolate_offset
+
+        self.seqlens = seqlens                    # save for the forward test
+        self.ckpt_thresh = 80 * 80              # 25 600 tokens
+
+
+
         if is_learnable:
             self.embed = nn.Parameter(torch.zeros(1, *seqlens, dim))
             print(is_learnable)
@@ -241,9 +269,25 @@ class VitPosEmbed(nn.Module):
 
     def forward(self, x):
         assert x.ndim == self._expected_x_ndim
+        S = (self.seqlens[0] * self.seqlens[1]) if self.seqlens \
+            else (self.seqlens[0] * self.seqlens[1]) if self.seqlens \
+            else x.shape[1]
+
+        need_ckpt = (
+            self.training
+            and x.requires_grad
+            and S >= self.ckpt_thresh
+        )
+
+        if need_ckpt:
+            # Note: use_reentrant=False is recommended unless you need legacy behavior
+            return torch.utils.checkpoint.checkpoint(self._forward_impl, x, use_reentrant=False)
+        else:
+            return self._forward_impl(x)
+
+    def _forward_impl(self, x):
         if x.shape[1:] != self.embed.shape[1:]:
             assert self.allow_interpolation
-            # Select interpolation mode based on number of dimensions
             if len(self.seqlens) == 1:
                 mode = "linear"
             elif len(self.seqlens) == 2:

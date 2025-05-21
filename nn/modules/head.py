@@ -13,9 +13,10 @@ from ultralytics.utils.tal import TORCH_1_10, dist2bbox, dist2rbox, make_anchors
 from .block import DFL, BNContrastiveHead, ContrastiveHead, Proto
 from .conv import Conv, DWConv
 from .transformer import MLP, DeformableTransformerDecoder, DeformableTransformerDecoderLayer
+from ultralytics.models.utils.ops import get_cdn_group
 from .utils import bias_init_with_prob, linear_init
 
-__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect"
+__all__ = "Detect", "Segment", "Pose", "Classify", "OBB", "RTDETRDecoder", "v10Detect", "ViLBasedRTDETRHead"
 
 
 # #native dimensions input
@@ -810,3 +811,594 @@ class v10Detect(Detect):
             for x in ch
         )
         self.one2one_cv3 = copy.deepcopy(self.cv3)
+
+from ultralytics.nn.modules.vision_lstm.vision_lstm2 import *
+# head.py  ▸  ViLBasedRTDETRHead  (fully self-contained)
+
+import warnings
+import torch, torch.nn as nn
+from torch.nn.init import constant_
+from ultralytics.models.utils.ops import get_cdn_group
+from .utils import bias_init_with_prob, linear_init
+
+# class ViLBasedRTDETRHead(nn.Module):
+#     export = False                     # keep Ultralytics export switch
+
+#     # ------------------------------------------------------------------ #
+#     #                           INITIALISATION                           #
+#     # ------------------------------------------------------------------ #
+#     def __init__(
+#         self,
+#         ch_vil,                        # e.g. (64,128,256)
+#         vil_fpn_spatial_shapes,        # e.g. [[80,80],[40,40],[20,20]]
+#         hidden_dim        = 256,
+#         num_queries       = 300,
+#         num_vil_self_attn_layers = 2,
+#         vil_block_decoder_args = None,
+#         act               = nn.SiLU,
+#         nc                = 80,
+#         num_denoising     = 0,
+#         label_noise_ratio = 0.5,
+#         box_noise_scale   = 1.0,
+#         grid_size_anchor  = 0.05,
+#         return_intermediate_outputs = False,
+#     ):
+#         super().__init__()
+
+#         # ------------ static attributes ------------- #
+#         self.nc, self.hidden_dim = int(nc), int(hidden_dim)
+#         self.num_queries, self.num_denoising = int(num_queries), int(num_denoising)
+#         self.grid_size_anchor = grid_size_anchor
+
+#         # ------------ input projection --------------- #
+#         self.input_proj = nn.ModuleList(
+#             [nn.Sequential(nn.Linear(c, hidden_dim), nn.LayerNorm(hidden_dim)) for c in ch_vil]
+#         )
+#         self.register_buffer(               # tiny tensor → moved automatically with the module
+#             "vil_fpn_spatial_shapes", torch.tensor(vil_fpn_spatial_shapes, dtype=torch.long), persistent=False
+#         )
+
+#         # ------------ dense-proposal heads ----------- #
+#         self.proposal_feature_transform = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
+#                                                         nn.LayerNorm(hidden_dim))
+#         self.proposal_score_head = nn.Linear(hidden_dim, nc)
+#         self.proposal_box_head   = MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU)
+
+#         # ------------ ViL “decoder” ------------------- #
+#         base_cfg = dict(
+#             dim=hidden_dim, direction="ROWWISE_FROM_TOP_LEFT", conv_kind="causal1d",
+#             conv_kernel_size=3, proj_bias=True, norm_bias=True, num_blocks=1,
+#             init_weights="original", chunk_size=64,
+#             qkv_block_size=max(1, hidden_dim // 64 if hidden_dim >= 64 else hidden_dim // 16),
+#         )
+#         base_cfg.update(vil_block_decoder_args or {})
+#         if hidden_dim % base_cfg["qkv_block_size"]:
+#             base_cfg["qkv_block_size"] = next((d for d in (16,32,64,128,256) if hidden_dim % d == 0), 1)
+#         self.vil_self_attn_decoder = nn.ModuleList(
+#             [ViLBlock(**base_cfg) for _ in range(num_vil_self_attn_layers)]
+#         )
+
+#         # ------------ prediction heads --------------- #
+#         n_sets = 1 if not return_intermediate_outputs else max(1, num_vil_self_attn_layers)
+#         self.final_score_heads = nn.ModuleList(nn.Linear(hidden_dim, nc) for _ in range(n_sets))
+#         self.final_box_heads   = nn.ModuleList(MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU) for _ in range(n_sets))
+
+#         # ------------ optional denoising ------------- #
+#         self.denoising_class_embed = nn.Embedding(nc, hidden_dim) if self.num_denoising else None
+#         self.label_noise_ratio, self.box_noise_scale = label_noise_ratio, box_noise_scale
+
+#         # ------------ query positional enc ----------- #
+#         self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2, act=nn.SiLU)
+
+#         self._reset_parameters()
+
+#     # ------------------------------------------------------------------ #
+#     #                        PARAMETER INIT                               #
+#     # ------------------------------------------------------------------ #
+#     def _reset_parameters(self):
+#         bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+#         for mod in self.modules():
+#             if isinstance(mod, nn.Linear) and mod.weight.requires_grad:
+#                 nn.init.xavier_uniform_(mod.weight)
+#         for h in self.final_score_heads:
+#             constant_(h.bias, bias_cls)
+#         for m in self.final_box_heads:
+#             constant_(m.layers[-1].weight, 0.0)
+#             constant_(m.layers[-1].bias,   0.0)
+
+#     # ------------------------------------------------------------------ #
+#     # helpers: anchors & meshgrid                                         #
+#     # ------------------------------------------------------------------ #
+#     @staticmethod
+#     def _meshgrid(h, w, dtype, device):
+#         y, x = torch.arange(h, dtype=dtype, device=device), torch.arange(w, dtype=dtype, device=device)
+#         gy, gx = torch.meshgrid(y, x, indexing="ij")
+#         return gx, gy
+
+#     def _generate_anchors_cxcywh_norm(self, shapes, dtype, device):
+#         out = []
+#         for i, (h, w) in enumerate(shapes):
+#             gx, gy = self._meshgrid(int(h), int(w), dtype, device)
+#             cxcy = (torch.stack([gx, gy], -1).float() + 0.5) / torch.tensor([w, h], dtype=dtype, device=device)
+#             wh   = torch.full_like(cxcy, self.grid_size_anchor * (2.0 ** i))
+#             out.append(torch.cat([cxcy, wh], -1).view(-1, 4))
+#         return torch.cat(out).unsqueeze(0)          # (1, ΣHW, 4)
+
+#     # ------------------------------------------------------------------ #
+#     # stage-1: dense proposals ( + optional CDN )                         #
+#     # ------------------------------------------------------------------ #
+#     def _get_initial_proposals(self, feats, batch):
+#         seqs = [
+#             proj(f.permute(0,2,3,1).reshape(f.size(0), -1, f.size(1))) for f, proj in zip(feats, self.input_proj)
+#         ]
+#         cat  = torch.cat(seqs, 1)                                   # (B, Ntok, D)
+#         bs, ntok, _ = cat.shape
+
+#         anchors = self._generate_anchors_cxcywh_norm(
+#             self.vil_fpn_spatial_shapes, cat.dtype, cat.device
+#         ).repeat(bs,1,1)
+#         dense_feat = self.proposal_feature_transform(cat)
+#         logits     = self.proposal_score_head(dense_feat)           # (B, Ntok, C)
+#         deltas     = self.proposal_box_head  (dense_feat)           # (B, Ntok, 4)
+
+#         ref_cxcy, ref_wh = anchors[...,:2], anchors[...,2:]
+#         boxes = torch.cat([
+#             ref_cxcy + deltas[...,:2] * ref_wh,
+#             ref_wh  * torch.exp(deltas[...,2:])
+#         ], -1).sigmoid()
+
+#         topk = logits.sigmoid().amax(-1).topk(min(self.num_queries, ntok), 1).indices
+#         gather = lambda t,d: torch.gather(t,1,topk.unsqueeze(-1).expand(-1,-1,d))
+#         sel_feat  = gather(cat  , self.hidden_dim)
+#         sel_box   = gather(boxes, 4)
+#         sel_score = gather(logits, self.nc)
+
+#         dn_meta = dict(
+#             num_denoising_queries = 0,
+#             num_matching_queries  = sel_feat.size(1),
+#             dn_num_split          = [0, sel_feat.size(1)],
+#             dn_pos_idx            = [],
+#             dn_num_group          = 0,
+#         )
+
+#         # optional CDN (denoising) – only in training
+#         dn_emb = dn_bbox = attn_mask = None
+#         if self.training and self.num_denoising:
+#             try:
+#                 dn_emb, dn_bbox, attn_mask, extra = get_cdn_group(
+#                     batch, self.nc, sel_feat.size(1),
+#                     self.denoising_class_embed.weight,
+#                     self.num_denoising, self.label_noise_ratio,
+#                     self.box_noise_scale, True
+#                 )
+#                 dn_meta.update(extra)
+#                 dn_meta["num_denoising_queries"] = dn_emb.size(1)
+#                 dn_meta["dn_num_split"] = [dn_emb.size(1), sel_feat.size(1)]
+#             except Exception as e:
+#                 warnings.warn(f"CDN disabled: {e}")
+
+#         qry_feat = torch.cat([dn_emb, sel_feat],1) if dn_emb is not None else sel_feat
+#         qry_box  = torch.cat([dn_bbox, sel_box],1) if dn_bbox is not None else sel_box
+
+#         return qry_feat, qry_box, sel_score, sel_box, attn_mask, dn_meta
+
+#     # ------------------------------------------------------------------ #
+#     #                           FORWARD                                   #
+#     # ------------------------------------------------------------------ #
+#     def forward(self, x, batch=None):
+#         qf, qb, enc_scores, enc_boxes, _, dn_meta = \
+#             self._get_initial_proposals(x, batch if self.training else None)
+
+#         # ------ make sure everything is same dtype (AMP-safe) ------------ #
+#         tgt_dtype = self.query_pos_head.layers[0].weight.dtype
+#         qf, qb = qf.to(tgt_dtype), qb.to(tgt_dtype)
+
+#         # ------ ViL decoder --------------------------------------------- #
+#         q = qf + self.query_pos_head(qb.detach())
+#         cls_out, box_out = [], []
+#         for i, layer in enumerate(self.vil_self_attn_decoder):
+#             q = layer(q)
+#             idx = i if i < len(self.final_box_heads) else 0
+#             cls_out.append(self.final_score_heads[idx](q))
+#             box_out.append(self.final_box_heads[idx](q).sigmoid())
+#         dec_scores, dec_boxes = torch.stack(cls_out), torch.stack(box_out)
+
+#         # ensure split info present
+#         dn_meta.setdefault("dn_num_split", [
+#             dn_meta.get("num_denoising_queries", 0),
+#             dn_meta.get("num_matching_queries",  0)
+#         ])
+
+#         # ---------------------- training path --------------------------- #
+#         if self.training:
+#             k = dn_meta["num_matching_queries"]
+#             return dec_boxes, dec_scores, enc_boxes[:, :k], enc_scores[:, :k], dn_meta
+
+#         # ---------------------- inference / validation ------------------ #
+#         # ‹dn_meta=None› prevents the RT-DETR loss from trying to split dn queries
+#         dn_meta = None
+#         final_boxes, final_scores = dec_boxes[-1], dec_scores[-1].sigmoid()
+#         out = torch.cat([final_boxes, final_scores], -1)             # (B, N, 4+C)
+#         return out if self.export else (out, (dec_boxes, dec_scores, enc_boxes, enc_scores, dn_meta))
+
+
+
+from .vision_lstm.vision_lstm2 import *
+# class ViLBasedRTDETRHead(nn.Module):
+#     """RT-DETR head using ViL ‘writers’ + xLSTM ‘readers’ (linear-time cross-attention)."""
+#     export = False
+
+#     def __init__(
+#         self,
+#         ch_vil,                     # (64,128,256)
+#         vil_fpn_spatial_shapes,     # [[80,80],[40,40],[20,20]]
+#         hidden_dim        = 256,
+#         num_queries       = 300,
+#         num_vil_self_attn_layers = 2,
+#         vil_block_decoder_args = None,
+#         act               = nn.SiLU, 
+#         nc                = 80,
+#         num_denoising     = 0,
+#         label_noise_ratio = 0.5,
+#         box_noise_scale   = 1.0,
+#         grid_size_anchor  = 0.05,
+#         return_intermediate_outputs = False,
+#     ):
+#         super().__init__()
+#         print(num_queries)
+#         print(num_denoising)
+
+#         # ── constants ───────────────────────────────────────────────────
+#         self.nc, self.hidden_dim = int(nc), int(hidden_dim)
+#         self.num_queries, self.num_denoising = int(num_queries), int(num_denoising)
+#         self.grid_size_anchor = grid_size_anchor
+
+#         # ── 1. ViL-FPN projection (C,H,W) → (HW,D)  ---------------------
+#         self.input_proj = nn.ModuleList(
+#             nn.Sequential(nn.Linear(c, hidden_dim), nn.LayerNorm(hidden_dim)) for c in ch_vil
+#         )
+#         self.register_buffer("vil_fpn_spatial_shapes",
+#                              torch.tensor(vil_fpn_spatial_shapes, dtype=torch.long),
+#                              persistent=False)
+
+#         # ── 2. dense-proposal stage (unchanged vs RT-DETR) --------------
+#         self.proposal_feature_transform = nn.Sequential(nn.Linear(hidden_dim, hidden_dim),
+#                                                         nn.LayerNorm(hidden_dim))
+#         self.proposal_score_head = nn.Linear(hidden_dim, nc)
+#         self.proposal_box_head   = MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU)
+
+#         # ── 3. ViL “writers” -------------------------------------------
+#         base_cfg = dict(
+#             dim=hidden_dim, direction="ROWWISE_FROM_TOP_LEFT",
+#             conv_kind="causal1d", conv_kernel_size=3,
+#             proj_bias=True, norm_bias=True, num_blocks=1,
+#             init_weights="original", chunk_size=64,
+#             qkv_block_size=max(1, hidden_dim // 64 if hidden_dim >= 64 else hidden_dim // 16),
+#         )
+#         base_cfg.update(vil_block_decoder_args or {})
+#         if hidden_dim % base_cfg["qkv_block_size"]:
+#             base_cfg["qkv_block_size"] = next((d for d in (16,32,64,128,256) if hidden_dim % d == 0), 1)
+
+#         self.writer = nn.ModuleList(ViLBlock(**base_cfg) for _ in range(num_vil_self_attn_layers))
+
+#         # ── 4. xLSTM cross “readers” ------------------------------------
+#         self.reader = nn.ModuleList(
+#             xLSTMCrossReader(
+#                 dim              = hidden_dim,
+#                 expansion        = base_cfg["num_blocks"],
+#                 qkv_block_size   = base_cfg["qkv_block_size"],
+#                 conv_kind        = base_cfg["conv_kind"],
+#                 conv_kernel_size = base_cfg["conv_kernel_size"],
+#                 chunk_size       = base_cfg["chunk_size"],
+#                 gate_soft_cap    = base_cfg.get("gate_soft_cap", 15.0),
+#             ) for _ in range(num_vil_self_attn_layers)
+#         )
+
+#         # ── 5. prediction heads (aux-loss aware) ------------------------
+#         n_sets = max(1, num_vil_self_attn_layers) if return_intermediate_outputs else 1
+#         self.final_score_heads = nn.ModuleList(nn.Linear(hidden_dim, nc) for _ in range(n_sets))
+#         self.final_box_heads   = nn.ModuleList(MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU) for _ in range(n_sets))
+
+#         # ── 6. denoising -----------------------------------------------
+#         self.denoising_class_embed = nn.Embedding(nc, hidden_dim) if self.num_denoising else None
+#         self.label_noise_ratio, self.box_noise_scale = label_noise_ratio, box_noise_scale
+
+#         # ── 7. query positional encoding -------------------------------
+#         self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2, act=nn.SiLU)
+
+#         self._reset_parameters()
+
+#     def _reset_parameters(self):
+#         bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear) and m.weight.requires_grad:
+#                 nn.init.xavier_uniform_(m.weight)
+#         for h in self.final_score_heads:
+#             constant_(h.bias, bias_cls)
+#         for m in self.final_box_heads:
+#             constant_(m.layers[-1].weight, 0.0)
+#             constant_(m.layers[-1].bias,   0.0)
+
+#     @staticmethod
+#     def _meshgrid(H, W, dtype, device):
+#         y, x = torch.arange(H, dtype=dtype, device=device), torch.arange(W, dtype=dtype, device=device)
+#         gy, gx = torch.meshgrid(y, x, indexing="ij")
+#         return gx, gy
+
+#     def _anchors(self, dtype, device):
+#         shapes = self.vil_fpn_spatial_shapes.to(device)           # ensure same device
+#         out = []
+#         for i, (H, W) in enumerate(shapes):
+#             gx, gy = self._meshgrid(int(H), int(W), dtype, device)
+#             cxcy = (torch.stack([gx, gy], -1).float() + 0.5) / torch.tensor([W, H], dtype=dtype, device=device)
+#             wh   = torch.full_like(cxcy, self.grid_size_anchor * (2.0 ** i))
+#             out.append(torch.cat([cxcy, wh], -1).view(-1, 4))
+#         return torch.cat(out).unsqueeze(0)  # (1, ΣHW, 4)
+
+#     def _initial_queries(self, feats, batch):
+#         seqs = [
+#             proj_layer(f.permute(0, 2, 3, 1).reshape(f.size(0), -1, f.size(1)))
+#             for f, proj_layer in zip(feats, self.input_proj)
+#         ]
+#         cat = torch.cat(seqs, 1)
+#         bs, ntok, _ = cat.shape
+#         anchors = self._anchors(cat.dtype, cat.device).repeat(bs, 1, 1)
+
+#         dense = self.proposal_feature_transform(cat)
+#         score = self.proposal_score_head(dense)
+#         delta = self.proposal_box_head(dense)
+
+#         ref_cxcy, ref_wh = anchors[..., :2], anchors[..., 2:]
+#         boxes = torch.cat([ref_cxcy + delta[..., :2] * ref_wh,
+#                         ref_wh * torch.exp(delta[..., 2:])], -1).sigmoid()
+
+#         k = max(1, min(self.num_queries, ntok))
+#         topk = score.sigmoid().amax(-1).topk(k, 1).indices
+#         gather = lambda t, d: torch.gather(t, 1, topk.unsqueeze(-1).expand(-1, -1, d))
+#         sel_feat, sel_box, sel_score = gather(cat, self.hidden_dim), gather(boxes, 4), gather(score, self.nc)
+
+#         # Properly initialized default dn_meta (ensuring compatibility with RT-DETR loss function)
+#         dn_meta = dict(
+#             num_denoising_queries=0,
+#             num_matching_queries=k,
+#             dn_num_split=[0, k],
+#             dn_pos_idx=[torch.zeros([0], dtype=torch.long, device=cat.device) for _ in range(bs)],
+#             dn_num_group=0
+#         )
+
+#         dn_emb = dn_bbox = None
+#         if self.training and self.num_denoising:
+#             try:
+#                 dn_emb, dn_bbox, _, extra = get_cdn_group(
+#                     batch, self.nc, k, self.denoising_class_embed.weight,
+#                     self.num_denoising, self.label_noise_ratio, self.box_noise_scale, True
+#                 )
+#                 dn_meta.update(extra)
+#                 dn_meta["num_denoising_queries"] = dn_emb.size(1)
+#                 dn_meta["dn_num_split"] = [dn_emb.size(1), k]
+#             except Exception as e:
+#                 warnings.warn(f"CDN disabled: {e}")
+
+#         q_feat = torch.cat([dn_emb, sel_feat], 1) if dn_emb is not None else sel_feat
+#         q_box = torch.cat([dn_bbox, sel_box], 1) if dn_bbox is not None else sel_box
+#         return q_feat, q_box, sel_score, sel_box, dn_meta
+
+#     def forward(self, x, batch=None):
+#         qf, qb, enc_scores, enc_boxes, dn_meta = (*self._initial_queries(x, batch if self.training else None),)
+#         tgt_dtype = self.query_pos_head.layers[0].weight.dtype
+#         q = qf.to(tgt_dtype) + self.query_pos_head(qb.to(tgt_dtype).detach())
+#         cls_all, box_all = [], []
+#         for i in range(len(self.writer)):
+#             memory = self.writer[i](q)
+#             q = self.reader[i](memory, q)
+#             head_idx = i if i < len(self.final_box_heads) else 0
+#             cls_all.append(self.final_score_heads[head_idx](q))
+#             box_all.append(self.final_box_heads[head_idx](q).sigmoid())
+#         dec_scores, dec_boxes = torch.stack(cls_all), torch.stack(box_all)
+
+#         k = dn_meta["num_matching_queries"]
+
+#         if self.training:
+#             return dec_boxes, dec_scores, enc_boxes[:, :k], enc_scores[:, :k], dn_meta
+#         else:
+#             if dn_meta["num_denoising_queries"] > 0:
+#                 offset = dn_meta["num_denoising_queries"]
+#                 out = torch.cat([dec_boxes[-1][:, offset:], dec_scores[-1][:, offset:].sigmoid()], -1)
+#             else:
+#                 out = torch.cat([dec_boxes[-1], dec_scores[-1].sigmoid()], -1)
+#             dn_meta = None  # Set dn_meta to None during validation
+#             return out, (dec_boxes, dec_scores, enc_boxes, enc_scores, dn_meta)
+
+
+
+class ViLBasedRTDETRHead(nn.Module):
+    """RT-DETR head using ViLLayerFusedQKV writers + strict-masking xLSTM readers with directionality."""
+    export = False
+
+    def __init__(
+        self,
+        ch_vil,
+        vil_fpn_spatial_shapes,
+        hidden_dim=256,
+        num_queries=300,
+        num_vil_self_attn_layers=2,
+        vil_block_decoder_args=None,
+        act=nn.SiLU, 
+        nc=80,
+        num_denoising=0,
+        label_noise_ratio=0.5,
+        box_noise_scale=1.0,
+        grid_size_anchor=0.05,
+        return_intermediate_outputs=False,
+    ):
+        super().__init__()
+        self.nc, self.hidden_dim = int(nc), int(hidden_dim)
+        self.num_queries, self.num_denoising = int(num_queries), int(num_denoising)
+        self.grid_size_anchor = grid_size_anchor
+
+        self.input_proj = nn.ModuleList(
+            nn.Sequential(nn.Linear(c, hidden_dim), nn.LayerNorm(hidden_dim)) for c in ch_vil
+        )
+        self.register_buffer("vil_fpn_spatial_shapes",
+                             torch.tensor(vil_fpn_spatial_shapes, dtype=torch.long),
+                             persistent=False)
+
+        self.proposal_feature_transform = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim)
+        )
+        self.proposal_score_head = nn.Linear(hidden_dim, nc)
+        self.proposal_box_head   = MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU)
+
+        base_cfg = dict(
+            dim=hidden_dim,
+            expansion=2,
+            qkv_block_size=max(1, hidden_dim // 64 if hidden_dim >= 64 else hidden_dim // 16),
+            proj_bias=True,
+            norm_bias=True,
+            num_blocks=1,
+            gate_soft_cap=15.0,
+            chunk_size=64,
+        )
+        if vil_block_decoder_args is not None:
+            base_cfg.update(vil_block_decoder_args)
+        if hidden_dim % base_cfg["qkv_block_size"]:
+            base_cfg["qkv_block_size"] = next(
+                (d for d in (16, 32, 64, 128, 256) if hidden_dim % d == 0), 1
+            )
+
+        # Alternate direction for each layer (even=forward, odd=reverse)
+        self.writer = nn.ModuleList(
+            ViLLayerFusedQKV(
+                **base_cfg,
+                direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
+            ) for i in range(num_vil_self_attn_layers)
+        )
+        self.reader = nn.ModuleList(
+            RefactoredxLSTMCrossReader(
+                dim=hidden_dim,
+                expansion=base_cfg["expansion"],
+                qkv_block_size=base_cfg["qkv_block_size"],
+                chunk_size=base_cfg["chunk_size"],
+                gate_soft_cap=base_cfg["gate_soft_cap"],
+                direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
+            ) for i in range(num_vil_self_attn_layers)
+        )
+
+        n_sets = max(1, num_vil_self_attn_layers) if return_intermediate_outputs else 1
+        self.final_score_heads = nn.ModuleList(nn.Linear(hidden_dim, nc) for _ in range(n_sets))
+        self.final_box_heads = nn.ModuleList(
+            MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU) for _ in range(n_sets)
+        )
+        self.denoising_class_embed = nn.Embedding(nc, hidden_dim) if self.num_denoising else None
+        self.label_noise_ratio, self.box_noise_scale = label_noise_ratio, box_noise_scale
+        self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2, act=nn.SiLU)
+        self._reset_parameters()
+
+
+    def _reset_parameters(self):
+        bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+        for m in self.modules():
+            if isinstance(m, nn.Linear) and m.weight.requires_grad:
+                nn.init.xavier_uniform_(m.weight)
+        for h in self.final_score_heads:
+            constant_(h.bias, bias_cls)
+        for m in self.final_box_heads:
+            constant_(m.layers[-1].weight, 0.0)
+            constant_(m.layers[-1].bias,   0.0)
+
+    @staticmethod
+    def _meshgrid(H, W, dtype, device):
+        y, x = torch.arange(H, dtype=dtype, device=device), torch.arange(W, dtype=dtype, device=device)
+        gy, gx = torch.meshgrid(y, x, indexing="ij")
+        return gx, gy
+
+    def _anchors(self, dtype, device):
+        shapes = self.vil_fpn_spatial_shapes.to(device)
+        out = []
+        for i, (H, W) in enumerate(shapes):
+            gx, gy = self._meshgrid(int(H), int(W), dtype, device)
+            cxcy = (torch.stack([gx, gy], -1).float() + 0.5) / torch.tensor([W, H], dtype=dtype, device=device)
+            wh   = torch.full_like(cxcy, self.grid_size_anchor * (2.0 ** i))
+            out.append(torch.cat([cxcy, wh], -1).view(-1, 4))
+        return torch.cat(out).unsqueeze(0)
+
+    def _initial_queries(self, feats, batch):
+        seqs = [
+            proj_layer(f.permute(0, 2, 3, 1).reshape(f.size(0), -1, f.size(1)))
+            for f, proj_layer in zip(feats, self.input_proj)
+        ]
+        cat = torch.cat(seqs, 1)
+        bs, ntok, _ = cat.shape
+        anchors = self._anchors(cat.dtype, cat.device).repeat(bs, 1, 1)
+
+        dense = self.proposal_feature_transform(cat)
+        score = self.proposal_score_head(dense)
+        delta = self.proposal_box_head(dense)
+
+        ref_cxcy, ref_wh = anchors[..., :2], anchors[..., 2:]
+        boxes = torch.cat([ref_cxcy + delta[..., :2] * ref_wh,
+                           ref_wh * torch.exp(delta[..., 2:])], -1).sigmoid()
+
+        k = max(1, min(self.num_queries, ntok))
+        topk = score.sigmoid().amax(-1).topk(k, 1).indices
+        gather = lambda t, d: torch.gather(t, 1, topk.unsqueeze(-1).expand(-1, -1, d))
+        sel_feat, sel_box, sel_score = gather(cat, self.hidden_dim), gather(boxes, 4), gather(score, self.nc)
+
+        dn_meta = dict(
+            num_denoising_queries=0,
+            num_matching_queries=k,
+            dn_num_split=[0, k],
+            dn_pos_idx=[torch.zeros([0], dtype=torch.long, device=cat.device) for _ in range(bs)],
+            dn_num_group=0
+        )
+
+        dn_emb = dn_bbox = None
+        if self.training and self.num_denoising:
+            try:
+                dn_emb, dn_bbox, _, extra = get_cdn_group(
+                    batch, self.nc, k, self.denoising_class_embed.weight,
+                    self.num_denoising, self.label_noise_ratio, self.box_noise_scale, True
+                )
+                dn_meta.update(extra)
+                dn_meta["num_denoising_queries"] = dn_emb.size(1)
+                dn_meta["dn_num_split"] = [dn_emb.size(1), k]
+            except Exception as e:
+                warnings.warn(f"CDN disabled: {e}")
+
+        q_feat = torch.cat([dn_emb, sel_feat], 1) if dn_emb is not None else sel_feat
+        q_box = torch.cat([dn_bbox, sel_box], 1) if dn_bbox is not None else sel_box
+        return q_feat, q_box, sel_score, sel_box, dn_meta
+
+    def forward(self, x, batch=None):
+        # Prepare queries as before
+        qf, qb, enc_scores, enc_boxes, dn_meta = (*self._initial_queries(x, batch if self.training else None),)
+        tgt_dtype = self.query_pos_head.layers[0].weight.dtype
+        q = qf.to(tgt_dtype) + self.query_pos_head(qb.to(tgt_dtype).detach())
+        cls_all, box_all = [], []
+
+        # Prepare memory ONCE for all layers (project all FPN feature maps)
+        projected_feats = [
+            proj_layer(f.permute(0, 2, 3, 1).reshape(f.size(0), -1, f.size(1)))
+            for f, proj_layer in zip(x, self.input_proj)
+        ]
+        memory = torch.cat(projected_feats, 1)  # (B, N_mem, hidden_dim)
+
+        for i in range(len(self.writer)):
+            q = self.writer[i](q)                        # self-attn on queries (ViLLayer)
+            q = self.reader[i](memory=memory, queries=q) # cross-attn to image memory (xLSTM)
+            head_idx = i if i < len(self.final_box_heads) else 0
+            cls_all.append(self.final_score_heads[head_idx](q))
+            box_all.append(self.final_box_heads[head_idx](q).sigmoid())
+        dec_scores, dec_boxes = torch.stack(cls_all), torch.stack(box_all)
+
+        k = dn_meta["num_matching_queries"]
+        if self.training:
+            return dec_boxes, dec_scores, enc_boxes[:, :k], enc_scores[:, :k], dn_meta
+        else:
+            if dn_meta["num_denoising_queries"] > 0:
+                offset = dn_meta["num_denoising_queries"]
+                out = torch.cat([dec_boxes[-1][:, offset:], dec_scores[-1][:, offset:].sigmoid()], -1)
+            else:
+                out = torch.cat([dec_boxes[-1], dec_scores[-1].sigmoid()], -1)
+            dn_meta = None
+            return out, (dec_boxes, dec_scores, enc_boxes, enc_scores, dn_meta)

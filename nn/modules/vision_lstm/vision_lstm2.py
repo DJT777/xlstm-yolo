@@ -367,6 +367,428 @@ class ViLLayer(nn.Module):
         self.ffn_norm.reset_parameters()
         self.ffn.reset_parameters()
 
+# ViLLayer with directionality
+class ViLLayerFusedQKV(nn.Module):
+    def __init__(self,
+                 dim,
+                 expansion=2,
+                 qkv_block_size=4,
+                 proj_bias=True,
+                 norm_bias=True,
+                 num_blocks=1,
+                 gate_soft_cap=15.0,
+                 ffn_proj_factor=2.6667,
+                 ffn_round_up_to_multiple_of=64,
+                 weight_mode="fused",
+                 chunk_size=64,
+                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT
+    ):
+        super().__init__()
+        assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+        self.dim = dim
+        self.expansion = expansion
+        self.qkv_block_size = qkv_block_size
+        self.gate_soft_cap = gate_soft_cap
+        self.weight_mode = weight_mode
+        self.num_blocks = num_blocks
+        self.direction = direction
+
+        inner_dim = expansion * dim
+        num_heads = inner_dim // qkv_block_size
+        self.inner_dim = inner_dim
+        self.num_heads = num_heads
+
+        # Fused linear QKV projection (input -> [Q | K | V])
+        self.qkv_proj = nn.Linear(dim, 3 * inner_dim, bias=proj_bias)
+
+        self.mlstm_cell = MatrixLSTMCell(
+            dim=inner_dim,
+            num_heads=num_heads,
+            norm_bias=norm_bias,
+            eps=1e-5,
+            chunk_size=chunk_size,
+            gate_soft_cap=gate_soft_cap
+        )
+
+        self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
+        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn = FeedForward(
+            embedding_dim=dim,
+            ffn_proj_factor=ffn_proj_factor,
+            ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+            use_bias=proj_bias,
+            weight_mode=weight_mode,
+            num_blocks=num_blocks or 1,
+        )
+        self.reset_parameters()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Apply directionality: reverse if specified
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            x = x.flip(1)  # reverse along sequence axis
+        residual = x
+        x = self.norm(x)
+        qkv = self.qkv_proj(x)
+        q, k, v = torch.chunk(qkv, 3, dim=-1)
+        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+        x_mlstm = self.proj_down(h_tilde_state)
+        x = residual + x_mlstm
+        ffn_residual = x
+        x_ffn = self.ffn_norm(x)
+        x_ffn = self.ffn(x_ffn)
+        x = ffn_residual + x_ffn
+        # Restore original order if reversed
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            x = x.flip(1)
+        return x
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.qkv_proj.weight); nn.init.zeros_(self.qkv_proj.bias)
+        nn.init.xavier_uniform_(self.proj_down.weight); nn.init.zeros_(self.proj_down.bias)
+        self.mlstm_cell.reset_parameters()
+        self.norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
+        self.ffn.reset_parameters()
+
+
+class RefactoredxLSTMCrossReader(nn.Module):
+    """
+    Cross-attention xLSTM Reader: FusedQKV-like structure, with directionality and strict masking.
+    """
+    def __init__(self,
+                 dim,
+                 expansion=2,
+                 qkv_block_size=32,
+                 proj_bias=True,
+                 norm_bias=True,
+                 num_blocks=1,  # kept for API compatibility, unused
+                 gate_soft_cap=15.0,
+                 chunk_size=64,
+                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT
+    ):
+        super().__init__()
+        assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+        self.dim = dim
+        self.expansion = expansion
+        self.qkv_block_size = qkv_block_size
+        self.gate_soft_cap = gate_soft_cap
+        self.num_blocks = num_blocks
+        self.direction = direction
+
+        inner_dim = expansion * dim
+        num_heads = inner_dim // qkv_block_size
+        self.inner_dim = inner_dim
+        self.num_heads = num_heads
+
+        # Q, K, V projections
+        self.q_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+        self.k_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+        self.v_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+
+        self.mlstm_cell = MatrixLSTMCell(
+            dim=inner_dim,
+            num_heads=num_heads,
+            norm_bias=norm_bias,
+            eps=1e-5,
+            chunk_size=chunk_size,
+            gate_soft_cap=gate_soft_cap
+        )
+
+        self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
+        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn = FeedForward(
+            embedding_dim=dim,
+            ffn_proj_factor=2.6667,  # or make this an argument, if desired
+            ffn_round_up_to_multiple_of=64,
+            use_bias=proj_bias,
+            weight_mode="fused",
+            num_blocks=1,
+        )
+        self.reset_parameters()
+
+    def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+        # Apply directionality: reverse memory if specified
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            memory = memory.flip(1)
+        x = torch.cat([memory.detach(), queries], dim=1)  # (B, N_mem + N_q, D)
+
+        residual = x
+        x = self.norm(x)
+
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
+
+        N_mem = memory.size(1)
+        # Mask out query positions in k/v (strict cross-attention, only memory writes)
+        if N_mem < x.shape[1]:
+            k[:, N_mem:, :] = 0.0
+            v[:, N_mem:, :] = 0.0
+
+        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+        x_mlstm = self.proj_down(h_tilde_state)
+
+        x = residual + x_mlstm
+        ffn_residual = x
+        x_ffn = self.ffn_norm(x)
+        x_ffn = self.ffn(x_ffn)
+        x = ffn_residual + x_ffn
+
+        # Output only the query portion, restoring order if reversed
+        out = x[:, N_mem:, :]
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            out = out.flip(1)
+        return out
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
+        nn.init.xavier_uniform_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
+        nn.init.xavier_uniform_(self.v_proj.weight); nn.init.zeros_(self.v_proj.bias)
+        nn.init.xavier_uniform_(self.proj_down.weight); nn.init.zeros_(self.proj_down.bias)
+        self.mlstm_cell.reset_parameters()
+        self.norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
+        self.ffn.reset_parameters()
+
+
+# class RefactoredxLSTMCrossReader(nn.Module):
+#     """
+#     Cross-reader that feeds (memory || queries) through a Matrix-LSTM cell using only linear projections.
+#     Only the query slice is returned, ready for the detection heads.
+#     Implements "strict cross-attention": only memory tokens write to memory, queries only read.
+#     """
+#     def __init__(self, *, dim: int, expansion: int = 2, qkv_block_size: int = 32,
+#                  chunk_size: int = 64, gate_soft_cap: float = 15.0,
+#                  proj_bias: bool = True, norm_bias: bool = True):
+#         super().__init__()
+#         self.inner_dim = expansion * dim
+#         self.num_heads = self.inner_dim // qkv_block_size
+        
+#         self.q_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+#         self.k_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+#         self.v_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+        
+#         # Core MatrixLSTMCell from your library
+#         self.core = MatrixLSTMCell(
+#             dim=self.inner_dim,
+#             num_heads=self.num_heads,
+#             chunk_size=chunk_size,
+#             gate_soft_cap=gate_soft_cap,
+#             norm_bias=norm_bias
+#         )
+        
+#         self.down = nn.Linear(self.inner_dim, dim, bias=proj_bias)
+#         self.rms = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn = nn.Sequential(
+#             nn.Linear(dim, dim * 4, bias=proj_bias),
+#             nn.SiLU(),
+#             nn.Linear(dim * 4, dim, bias=proj_bias),
+#         )
+#         self._init()
+
+#     def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+#         """
+#         memory  : (B, N_mem, D)
+#         queries : (B, N_q,   D)
+#         returns : (B, N_q,   D)
+#         """
+#         # Concatenate memory and queries (along sequence dimension)
+#         x = torch.cat([memory.detach(), queries], dim=1)  # [B, N_mem + N_q, D]
+#         res = x = self.rms(x)
+        
+#         # QKV projections
+#         q = self.q_proj(x)
+#         k = self.k_proj(x)
+#         v = self.v_proj(x)
+
+#         # === Strict cross-attention: ONLY memory tokens contribute to K/V ===
+#         N_mem = memory.size(1)
+#         if N_mem < x.shape[1]:
+#             k[:, N_mem:, :] = 0.0
+#             v[:, N_mem:, :] = 0.0
+#         # Optionally, could also mask out input/forget gates if using explicit gating
+#         # But most mLSTM cell impls will simply use K/V masking for cross-attn behavior
+
+#         # Process through MatrixLSTMCell (parallelized, as in xLSTM paper)
+#         h = self.core(q=q, k=k, v=v)  # [B, N_mem + N_q, inner_dim]
+        
+#         # Project back to original dimension
+#         h = self.down(h)  # [B, N_mem + N_q, D]
+        
+#         # Residual + FFN
+#         x = res + h
+#         y = x + self.ffn(self.ffn_norm(x))
+        
+#         # Return only the query portion
+#         return y[:, N_mem:, :]  # (B, N_q, D)
+
+#     def _init(self):
+#         nn.init.xavier_uniform_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
+#         nn.init.xavier_uniform_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
+#         nn.init.xavier_uniform_(self.v_proj.weight); nn.init.zeros_(self.v_proj.bias)
+#         nn.init.xavier_uniform_(self.down.weight);   nn.init.zeros_(self.down.bias)
+
+
+# class RefactoredxLSTMCrossReader(nn.Module):
+#     """
+#     Cross-reader that feeds (memory || queries) through a Matrix-LSTM cell using only linear projections.
+#     Only the query slice is returned, ready for the detection heads.
+#     """
+#     def __init__(self, *, dim: int, expansion: int = 2, qkv_block_size: int = 32,
+#                  chunk_size: int = 64, gate_soft_cap: float = 15.0,
+#                  proj_bias: bool = True, norm_bias: bool = True):
+#         super().__init__()
+        
+#         self.inner_dim = expansion * dim
+#         self.num_heads = self.inner_dim // qkv_block_size
+        
+#         # Direct linear projections for q, k, v from input
+#         self.q_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+#         self.k_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+#         self.v_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+        
+#         # Core MatrixLSTMCell from LIBRARY
+#         self.core = MatrixLSTMCell(dim=self.inner_dim, num_heads=self.num_heads,
+#                                   chunk_size=chunk_size, gate_soft_cap=gate_soft_cap,
+#                                   norm_bias=norm_bias)
+        
+#         # Down projection and normalization
+#         self.down = nn.Linear(self.inner_dim, dim, bias=proj_bias)
+#         self.rms = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        
+#         # Feed-forward network (MLP)
+#         self.ffn = nn.Sequential(
+#             nn.Linear(dim, dim * 4, bias=proj_bias),
+#             nn.SiLU(),
+#             nn.Linear(dim * 4, dim, bias=proj_bias),
+#         )
+        
+#         self._init()
+
+#     def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+#         """
+#         memory  : (B, N_mem, D)
+#         queries : (B, N_q,   D)
+#         returns : (B, N_q,   D)
+#         """
+#         # Concatenate memory and queries
+#         x = torch.cat([memory.detach(), queries], dim=1)  # [B, N_mem + N_q, D]
+#         res = x = self.rms(x)
+        
+#         # Direct projections to q, k, v
+#         q = self.q_proj(x)  # [B, N_mem + N_q, inner_dim]
+#         k = self.k_proj(x)  # [B, N_mem + N_q, inner_dim]
+#         v = self.v_proj(x)  # [B, N_mem + N_q, inner_dim]
+        
+#         # Process through MatrixLSTMCell
+#         h = self.core(q=q, k=k, v=v)  # [B, N_mem + N_q, inner_dim]
+        
+#         # Project back to original dimension
+#         h = self.down(h)  # [B, N_mem + N_q, D]
+        
+#         # Residual connection and FFN
+#         x = res + h
+#         y = x + self.ffn(self.ffn_norm(x))
+        
+#         # Return only the query portion
+#         N_mem = memory.size(1)
+#         return y[:, N_mem:, :]
+
+#     def _init(self):
+#         # Initialize weights
+#         nn.init.xavier_uniform_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
+#         nn.init.xavier_uniform_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
+#         nn.init.xavier_uniform_(self.v_proj.weight); nn.init.zeros_(self.v_proj.bias)
+#         nn.init.xavier_uniform_(self.down.weight);   nn.init.zeros_(self.down.bias)
+
+# class xLSTMCrossReader(nn.Module):
+#     """
+#     Cross-reader that feeds (memory || queries) through a Matrix-LSTM cell.
+#     Only the query slice is returned, ready for the detection heads.
+#     """
+
+#     def __init__(self, *, dim: int, expansion: int = 2, qkv_block_size: int = 32,
+#                  conv_kind: str = "causal1d", conv_kernel_size: int = 3,
+#                  chunk_size: int = 64, gate_soft_cap: float = 15.0,
+#                  proj_bias: bool = True, norm_bias: bool = True):
+#         super().__init__()
+
+#         self.inner_dim = expansion * dim
+#         self.num_heads = self.inner_dim // qkv_block_size
+
+#         # 1-linear “fused” up-projection:  (qk | v)
+#         self.up = nn.Linear(dim, 2 * self.inner_dim, bias=proj_bias)
+
+#         # depth-wise conv on qk branch
+#         if conv_kind == "causal1d":
+#             self.conv = CausalConv1d(self.inner_dim, kernel_size=conv_kernel_size, bias=proj_bias)
+#         elif conv_kind == "2d":
+#             self.conv = SequenceConv2d(self.inner_dim, self.inner_dim,
+#                                        kernel_size=conv_kernel_size,
+#                                        padding=conv_kernel_size // 2,
+#                                        groups=self.inner_dim, bias=proj_bias)
+#         else:
+#             raise ValueError(conv_kind)
+
+#         # QK → 2×inner, V → inner
+#         self.qk_proj = nn.Linear(self.inner_dim, 2 * self.inner_dim, bias=proj_bias)
+#         self.v_proj  = nn.Linear(self.inner_dim,     self.inner_dim, bias=proj_bias)
+
+#         self.core = MatrixLSTMCell(dim=self.inner_dim, num_heads=self.num_heads,
+#                                    chunk_size=chunk_size, gate_soft_cap=gate_soft_cap,
+#                                    norm_bias=norm_bias)
+
+#         self.skip_gain = nn.Parameter(torch.ones(self.inner_dim))
+#         self.down = nn.Linear(self.inner_dim, dim, bias=proj_bias)
+
+#         self.rms  = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn = nn.Sequential(
+#             nn.Linear(dim, dim * 4, bias=proj_bias),
+#             nn.SiLU(),
+#             nn.Linear(dim * 4, dim, bias=proj_bias),
+#         )
+
+#         self._init()
+
+#     # ------------------------------------------------------------------
+#     def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+#         """
+#         memory  : (B, N_mem, D)
+#         queries : (B, N_q,   D)
+#         returns : (B, N_q,   D)
+#         """
+#         x = torch.cat([memory.detach(), queries], dim=1)    # concat, freeze encoder grads
+#         res = x = self.rms(x)
+
+#         up = self.up(x)
+#         qk_conv_act, v_in = up.chunk(2, dim=-1)             # width = inner_dim
+#         qk_conv_act = F.silu(self.conv(qk_conv_act))
+
+#         qk = self.qk_proj(qk_conv_act)                      # width = 2·inner_dim
+#         q, k = qk.chunk(2, dim=-1)
+#         v    = self.v_proj(v_in)
+
+#         h = self.core(q=q, k=k, v=v)                        # (B,S,inner_dim)
+#         h = h + self.skip_gain * qk_conv_act                # <─ fixed: width matches
+#         h = self.down(h)                                    # (B,S,D)
+
+#         x = res + h
+#         y = x + self.ffn(self.ffn_norm(x))
+
+#         N_mem = memory.size(1)
+#         return y[:, N_mem:, :]
+
+#     # ------------------------------------------------------------------
+#     def _init(self):
+#         nn.init.xavier_uniform_(self.up.weight);  nn.init.zeros_(self.up.bias)
+#         nn.init.xavier_uniform_(self.qk_proj.weight); nn.init.zeros_(self.qk_proj.bias)
+#         nn.init.xavier_uniform_(self.v_proj.weight);  nn.init.zeros_(self.v_proj.bias)
+#         nn.init.xavier_uniform_(self.down.weight);    nn.init.zeros_(self.down.bias)
 
 #gpt 4.5
 # class ViLLayer(nn.Module):
@@ -554,8 +976,8 @@ class ViLBlock(nn.Module):
         self.drop_path = drop_path
         self.norm_bias = norm_bias
 
-        self.drop_path = DropPath(drop_prob=0.0)
-        self.norm = nn.RMSNorm(dim, eps=1e-3)
+        #self.drop_path = DropPath(drop_prob=0.0)
+        #self.norm = nn.RMSNorm(dim, eps=1e-3)
         self.layer = ViLLayer(dim,
                                 direction,
                                 qkv_block_size=qkv_block_size,
@@ -563,9 +985,9 @@ class ViLBlock(nn.Module):
                                 norm_bias=True,
                                 conv_bias=True,
                                 conv_kernel_size=3,
-                                conv_kind="2d",
+                                conv_kind=conv_kind,
                                 init_weights="original",
-                                seqlens=None,  # Initial seqlens, can be overridden in forward
+                                seqlens=seqlens,  # Initial seqlens, can be overridden in forward
                                 num_blocks=None,
                                 chunk_size=chunk_size,
                             )
@@ -584,7 +1006,7 @@ class ViLBlock(nn.Module):
 
     def reset_parameters(self):
         self.layer.reset_parameters()
-        self.norm.reset_parameters()
+        #self.norm.reset_parameters()
 
 # #original mlstm
 
@@ -662,7 +1084,7 @@ class MatrixLSTMCell(nn.Module):
         # Fused ifgate projection
         self.ifgate = nn.Linear(3 * dim, 2 * num_heads)
 
-        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-3)
+        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
         self.causal_mask_cache = {}
         self.chunk_size = chunk_size
 
@@ -704,7 +1126,7 @@ class MatrixLSTMCell(nn.Module):
             chunk_size=int(chunk_size),
             autocast_kernel_dtype="float16",
             return_last_states=False,
-            mode="train",
+            mode="train_with_padding",
             eps=5e-5
         )
         self.cpu_backend = mLSTMBackend(
@@ -719,7 +1141,7 @@ class MatrixLSTMCell(nn.Module):
             chunk_size=int(chunk_size),
             autocast_kernel_dtype="float16",
             return_last_states=False,
-            mode="train",
+            mode="train_with_padding",
             eps=5e-5
         )
         self.gpu_backend = mLSTMBackend(
@@ -1039,22 +1461,26 @@ from mlstm_kernels.torch.backend_module import mLSTMBackendConfig, mLSTMBackend
 from .mlstm_large import mLSTMLayerVision
 from .mlstm_large import VilLayerUpdated
 
+import torch.utils.checkpoint as cp
+
 class ViLBlockPair(nn.Module):
-    def __init__(
-        self,
-        dim,
-        drop_path=0.0,
-        conv_kind="2d",
-        conv_kernel_size=3,
-        proj_bias=True,
-        norm_bias=True,
-        seqlens=None,
-        num_blocks=15,
-        init_weights="original",
-        chunk_size=256,
-        qkv_block_size = 4
-    ):
+    def __init__(self,
+                 dim,
+                 drop_path=0.0,
+                 conv_kind="2d",
+                 conv_kernel_size=3,
+                 proj_bias=True,
+                 norm_bias=True,
+                 seqlens=None,
+                 num_blocks=15,
+                 init_weights="original",
+                 chunk_size=256,
+                 qkv_block_size=4):
         super().__init__()
+
+        self.seqlens = seqlens                    # save for the forward test
+        self.ckpt_thresh = 160 * 160              # 25 600 tokens
+        # -------------------------------------------------------------------
         self.rowwise_from_top_left = ViLBlock(
             dim=dim,
             direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT,
@@ -1067,7 +1493,7 @@ class ViLBlockPair(nn.Module):
             num_blocks=num_blocks,
             init_weights=init_weights,
             chunk_size=chunk_size,
-            qkv_block_size = qkv_block_size
+            qkv_block_size=qkv_block_size,
         )
         self.rowwise_from_bot_right = ViLBlock(
             dim=dim,
@@ -1081,13 +1507,86 @@ class ViLBlockPair(nn.Module):
             num_blocks=num_blocks,
             init_weights=init_weights,
             chunk_size=chunk_size,
-            qkv_block_size = qkv_block_size
+            qkv_block_size=qkv_block_size,
         )
 
+    # -----------------------------------------------------------------------
+    def _forward_impl(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.rowwise_from_top_left(x)
+        x = self.rowwise_from_bot_right(x)
+        return x
+
     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:
-        out1 = self.rowwise_from_top_left(x)
-        out2 = self.rowwise_from_bot_right(out1)
-        return out2
+        """
+        Runs the pair normally *unless* the token count exceeds 160²
+        (≈25 600).  In that case, and only while training, we wrap the
+        computation in torch.checkpoint to trade compute for memory.
+        """
+        # decide sequence length
+        S = (self.seqlens[0] * self.seqlens[1]) if self.seqlens \
+            else (seqlens[0] * seqlens[1]) if seqlens \
+            else x.shape[1]
+
+        need_ckpt = (
+            self.training                 # only in train mode
+            and x.requires_grad           # grads needed
+            and S >= self.ckpt_thresh      # token count threshold
+        )
+
+        if need_ckpt:
+            return cp.checkpoint(self._forward_impl, x, use_reentrant=False)
+
+        return self._forward_impl(x)
+
+# class ViLBlockPair(nn.Module):
+#     def __init__(
+#         self,
+#         dim,
+#         drop_path=0.0,
+#         conv_kind="2d",
+#         conv_kernel_size=3,
+#         proj_bias=True,
+#         norm_bias=True,
+#         seqlens=None,
+#         num_blocks=15,
+#         init_weights="original",
+#         chunk_size=256,
+#         qkv_block_size = 4
+#     ):
+#         super().__init__()
+#         self.rowwise_from_top_left = ViLBlock(
+#             dim=dim,
+#             direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT,
+#             drop_path=drop_path,
+#             conv_kind=conv_kind,
+#             conv_kernel_size=conv_kernel_size,
+#             proj_bias=proj_bias,
+#             norm_bias=norm_bias,
+#             seqlens=seqlens,
+#             num_blocks=num_blocks,
+#             init_weights=init_weights,
+#             chunk_size=chunk_size,
+#             qkv_block_size = qkv_block_size
+#         )
+#         self.rowwise_from_bot_right = ViLBlock(
+#             dim=dim,
+#             direction=SequenceTraversal.ROWWISE_FROM_BOT_RIGHT,
+#             drop_path=drop_path,
+#             conv_kind=conv_kind,
+#             conv_kernel_size=conv_kernel_size,
+#             proj_bias=proj_bias,
+#             norm_bias=norm_bias,
+#             seqlens=seqlens,
+#             num_blocks=num_blocks,
+#             init_weights=init_weights,
+#             chunk_size=chunk_size,
+#             qkv_block_size = qkv_block_size
+#         )
+
+#     def forward(self, x: torch.Tensor, seqlens=None) -> torch.Tensor:
+#         out1 = self.rowwise_from_top_left(x)
+#         out2 = self.rowwise_from_bot_right(out1)
+#         return out2
 
 
 class VisionLSTM2(nn.Module):
@@ -1533,4 +2032,3 @@ def wang_init_(param: torch.Tensor, dim: int, num_blocks: int):
     std = 2 / num_blocks / math.sqrt(dim)
     torch.nn.init.normal_(param, mean=0.0, std=std)
     return param
-

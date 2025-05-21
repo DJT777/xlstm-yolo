@@ -74,7 +74,8 @@ from .block import (
     PermuteBlock,
     FlattenPosEmbedBlock,
     PatchMerging,
-    ViLBlock
+    ViLBlock,
+    SimpleStem
 )
 from .conv import (
     CBAM,
@@ -92,7 +93,7 @@ from .conv import (
     RepConv,
     SpatialAttention,
 )
-from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect
+from .head import OBB, Classify, Detect, Pose, RTDETRDecoder, Segment, WorldDetect, v10Detect, ViLBasedRTDETRHead
 from .transformer import (
     AIFI,
     MLP,
@@ -181,4 +182,5 @@ __all__ = (
     "TorchVision",
     "Index",
     "A2C2f",
+    "ViLBasedRTDETRHead"
 )
