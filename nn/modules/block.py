@@ -2401,169 +2401,45 @@ class ViLBlock(nn.Module):
         x_out = einops.rearrange(x_image, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
         return x_out
 
-# class ViLFusionBlock(nn.Module):
-#     def __init__(
-#         self,
-#         in_channels: int,
-#         hidden_dim: int,
-#         config: dict,
-#         n: int = 1,
-#         mlp_ratio: float = 4.0,
-#         drop_path: float = 0.0,
-#         mlp_act_layer=nn.GELU,
-#         mlp_drop_rate: float = 0.0,
-#     ):
-#         """
-#         Initialize the FusionViLBlock, mirroring XSSBlock logic with ViLBlockPairBlock.
-
-#         Args:
-#             in_channels (int): Number of input channels.
-#             hidden_dim (int): Hidden dimension after projection.
-#             config (dict): Configuration dict with 'seqlens', etc.
-#             n (int): Number of ViLBlockPairBlock repetitions.
-#             mlp_ratio (float): Expansion ratio for MLP hidden dimension.
-#             drop_path (float): Drop path probability.
-#             norm_layer (callable): Normalization layer constructor.
-#             mlp_act_layer (type): Activation layer for MLP.
-#             mlp_drop_rate (float): Dropout rate for MLP.
-#         """
-#         super().__init__()
-
-#         # print(config)
-#         # Extract seqlens from config
-#         seqlens = config.get("seqlens")
-#         mlp_ratio = config.get("mlp_ratio")
-#         if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
-#             raise ValueError("config['seqlens'] must be a list/tuple of length 2 or 3")
-
-#         self.seqlens = seqlens
-#         self.hidden_dim = hidden_dim
-
-#         # Input projection (same as XSSBlock)
-#         self.in_proj = (
-#             nn.Sequential(
-#                 nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
-#                 nn.BatchNorm2d(hidden_dim),
-#                 nn.SiLU()
-#             ) if in_channels != hidden_dim else nn.Identity()
-#         )
-
-#         # Local spatial processing (LSBlock from XSSBlock)
-#         self.lsblock = LSBlock(hidden_dim, hidden_dim)
-
-#         # Normalization for sequence input (B, S, D)
-#         self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
-
-#         # ViLBlockPairBlock replacing SS2D
-#         self.vil = nn.Sequential(*[
-#             ViLBlockPairBlock(hidden_dim, hidden_dim, config)
-#             for _ in range(n)
-#         ])
-
-#         # DropPath from vision_lstm_util.py
-#         self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
-
-#         # Optional MLP branch (same as XSSBlock)
-#         self.mlp_branch = mlp_ratio > 0
-#         if self.mlp_branch:
-#             #print("MLP EXISTS!")
-#             self.norm2 = nn.LayerNorm(hidden_dim, eps=1e-6)  # Sequence norm
-#             mlp_hidden_dim = int(hidden_dim * mlp_ratio)
-#             self.mlp = RGBlock(
-#                 in_features=hidden_dim,
-#                 hidden_features=mlp_hidden_dim,
-#                 act_layer=mlp_act_layer,
-#                 drop=mlp_drop_rate
-#             )
-
-#     def forward(self, x):
-#         """
-#         Forward pass mirroring XSSBlock logic.
-
-#         Args:
-#             x (torch.Tensor): Input tensor of shape (B, C_in, H, W).
-
-#         Returns:
-#             torch.Tensor: Output tensor of shape (B, hidden_dim, H, W).
-#         """
-#         # Input projection
-#         x = self.in_proj(x)  # (B, hidden_dim, H, W)
-
-#         # Local spatial processing
-#         x_local = self.lsblock(x)  # (B, hidden_dim, H, W)
-
-#         # Flatten to sequence for ViLBlockPairBlock
-#         B, C, H, W = x_local.shape
-#         seq = einops.rearrange(x_local, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
-
-#         # Normalize and process with ViLBlockPairBlock
-#         #seq_norm = self.norm(seq)  # (B, S, hidden_dim)
-#         seq_out = self.vil(seq)  # (B, S, hidden_dim)
-
-#         # Apply drop path and residual connection in sequence space
-#         seq = seq + self.drop_path(seq_out)  # (B, S, hidden_dim)
-
-#         # Reshape back to 4D
-#         x_global = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
-
-#         # Residual connection with original input
-#         x = x + x_global  # (B, hidden_dim, H, W)
-
-#         # Optional MLP branch
-#         if self.mlp_branch:
-#             # Flatten again for MLP (RGBlock expects 4D input)
-#             seq = einops.rearrange(x, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
-#             # seq_norm = self.norm2(seq)  # (B, S, hidden_dim)
-#             # Reshape to 4D for RGBlock
-#             x_mlp = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
-#             x_mlp = self.mlp(x_mlp)  # (B, hidden_dim, H, W)
-#             # Add back with drop path
-#             x = x + self.drop_path(x_mlp)  # (B, hidden_dim, H, W)
-
-#         return x
-
-
-
 class ViLFusionBlock(nn.Module):
     def __init__(
         self,
         in_channels: int,
         hidden_dim: int,
-        config: dict, # Configuration dict, expected to contain 'seqlens', 'chunk_size', etc.
-        n: int = 1,   # Number of ViLBlockPairBlock repetitions
+        config: dict,
+        n: int = 1,
+        mlp_ratio: float = 4.0,
         drop_path: float = 0.0,
+        mlp_act_layer=nn.GELU,
+        mlp_drop_rate: float = 0.0,
     ):
         """
-        Initialize the ViLFusionBlock.
-        The explicit MLP branch has been removed as ViLLayer (within ViLBlockPairBlock)
-        now contains its own FFN (RGBlock).
+        Initialize the FusionViLBlock, mirroring XSSBlock logic with ViLBlockPairBlock.
 
         Args:
             in_channels (int): Number of input channels.
-            hidden_dim (int): Hidden dimension after projection and for ViL blocks.
-            config (dict): Configuration dict passed to ViLBlockPairBlock.
-                           Expected to contain 'seqlens', 'chunk_size', 'conv_kind', 'qkv_block_size'.
-                           Note: Any 'mlp_ratio' in this config for ViLFusionBlock's own MLP
-                           is no longer used by ViLFusionBlock directly. If this ratio was
-                           intended to control the FFN inside ViLLayer, ViLBlockPairBlock
-                           and ViLLayer would need adaptation to use it (e.g., as ffn_proj_factor).
+            hidden_dim (int): Hidden dimension after projection.
+            config (dict): Configuration dict with 'seqlens', etc.
             n (int): Number of ViLBlockPairBlock repetitions.
-            drop_path (float): Drop path probability for stochastic depth.
+            mlp_ratio (float): Expansion ratio for MLP hidden dimension.
+            drop_path (float): Drop path probability.
+            norm_layer (callable): Normalization layer constructor.
+            mlp_act_layer (type): Activation layer for MLP.
+            mlp_drop_rate (float): Dropout rate for MLP.
         """
         super().__init__()
 
+        # print(config)
+        # Extract seqlens from config
         seqlens = config.get("seqlens")
+        mlp_ratio = config.get("mlp_ratio")
         if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
-            # Assuming seqlens might be 3D for some video-like tasks, though typically [H,W] for images.
-            # The ViLLayer in the canvas expects seqlens=[H,W] for its RGBlock FFN.
-            LOGGER.warning(f"ViLFusionBlock: 'seqlens' in config is {seqlens}. Expected list/tuple of length 2 (H,W) for RGBlock in ViLLayer.")
-            # Depending on strictness, you might raise ValueError here.
-            # For now, we'll proceed, assuming ViLBlockPairBlock/ViLLayer handle it or it's correctly [H,W].
+            raise ValueError("config['seqlens'] must be a list/tuple of length 2 or 3")
 
-        self.seqlens = seqlens # Store for reference, primarily used by components within self.vil
+        self.seqlens = seqlens
         self.hidden_dim = hidden_dim
 
-        # Input projection: projects input to hidden_dim if channels differ
+        # Input projection (same as XSSBlock)
         self.in_proj = (
             nn.Sequential(
                 nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
@@ -2572,28 +2448,37 @@ class ViLFusionBlock(nn.Module):
             ) if in_channels != hidden_dim else nn.Identity()
         )
 
-        # Local spatial processing block (e.g., a 3x3 depthwise conv)
-        self.lsblock = LSBlock(hidden_dim, hidden_dim) # Assuming LSBlock takes (in_channels, out_channels)
+        # Local spatial processing (LSBlock from XSSBlock)
+        self.lsblock = LSBlock(hidden_dim, hidden_dim)
 
-        # Normalization for sequence input (currently not used in the forward pass provided)
-        # If re-enabled, ensure RMSNorm is correctly defined and imported.
-        # self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
+        # Normalization for sequence input (B, S, D)
+        self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
 
-        # Sequence processing part using ViLBlockPairBlock
-        # ViLBlockPairBlock internally uses ViLLayer, which now has the RGBlock FFN.
+        # ViLBlockPairBlock replacing SS2D
         self.vil = nn.Sequential(*[
-            ViLBlockPairBlock(hidden_dim, hidden_dim, config) # Pass hidden_dim and config
+            ViLBlockPairBlock(hidden_dim, hidden_dim, config)
             for _ in range(n)
         ])
 
-        # DropPath for stochastic depth
-        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0.0 else nn.Identity()
+        # DropPath from vision_lstm_util.py
+        self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0 else nn.Identity()
 
-        # The explicit MLP branch (self.norm2, self.mlp with RGBlock) has been removed.
+        # Optional MLP branch (same as XSSBlock)
+        self.mlp_branch = mlp_ratio > 0
+        if self.mlp_branch:
+            #print("MLP EXISTS!")
+            self.norm2 = nn.RMSNorm(hidden_dim, eps=1e-6)  # Sequence norm
+            mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+            self.mlp = RGBlock(
+                in_features=hidden_dim,
+                hidden_features=mlp_hidden_dim,
+                act_layer=mlp_act_layer,
+                drop=mlp_drop_rate
+            )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         """
-        Forward pass for ViLFusionBlock.
+        Forward pass mirroring XSSBlock logic.
 
         Args:
             x (torch.Tensor): Input tensor of shape (B, C_in, H, W).
@@ -2602,45 +2487,160 @@ class ViLFusionBlock(nn.Module):
             torch.Tensor: Output tensor of shape (B, hidden_dim, H, W).
         """
         # Input projection
-        x_projected = self.in_proj(x)  # Shape: (B, hidden_dim, H, W)
+        x = self.in_proj(x)  # (B, hidden_dim, H, W)
 
         # Local spatial processing
-        x_local_processed = self.lsblock(x_projected)  # Shape: (B, hidden_dim, H, W)
+        x_local = self.lsblock(x)  # (B, hidden_dim, H, W)
 
-        # Flatten for sequence processing: (B, hidden_dim, H, W) -> (B, H*W, hidden_dim)
-        B, C, H, W = x_local_processed.shape # C is hidden_dim here
-        # For clarity, let's use x_for_sequence to denote the input to the ViL part
-        x_for_sequence = x_local_processed 
-        seq_input = einops.rearrange(x_for_sequence, "b c h w -> b (h w) c")
+        # Flatten to sequence for ViLBlockPairBlock
+        B, C, H, W = x_local.shape
+        seq = einops.rearrange(x_local, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
 
-        # Optional normalization before ViL blocks (currently commented out in original)
-        # if hasattr(self, 'norm') and self.norm is not None:
-        #     seq_input = self.norm(seq_input)
+        # Normalize and process with ViLBlockPairBlock
+        #seq_norm = self.norm(seq)  # (B, S, hidden_dim)
+        seq_out = self.vil(seq)  # (B, S, hidden_dim)
 
-        # Process with ViLBlockPairBlocks (which contain ViLLayers with FFNs)
-        seq_output_vil = self.vil(seq_input)  # Shape: (B, S, hidden_dim)
+        # Apply drop path and residual connection in sequence space
+        seq = seq + self.drop_path(seq_out)  # (B, S, hidden_dim)
 
-        # Residual connection in sequence space (around the ViL blocks)
-        # Adds input to ViL block (seq_input) to its output (seq_output_vil)
-        seq_after_residual = seq_input + self.drop_path(seq_output_vil)
+        # Reshape back to 4D
+        x_global = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
 
-        # Reshape back to 4D image format: (B, S, hidden_dim) -> (B, hidden_dim, H, W)
-        x_global_vil_image = einops.rearrange(seq_after_residual, "b (h w) c -> b c h w", h=H, w=W)
+        # Residual connection with original input
+        x = x + x_global  # (B, hidden_dim, H, W)
 
-        # Combine local path (output of lsblock) and global path (output of ViL processing)
-        # The original code added x_local_processed + drop_path(x_global_vil_image)
-        # This effectively means: out_lsblock + out_vil_path
-        # If x_projected was intended as the other branch of the residual for x_global_vil_image,
-        # it would be x_projected + drop_path(x_global_vil_image).
-        # Sticking to the pattern from the provided code:
-        output = x_local_processed + self.drop_path(x_global_vil_image)
-        # This combines the output of the local spatial block with the output of the
-        # ViL sequence processing blocks.
+        # Optional MLP branch
+        if self.mlp_branch:
+            # Flatten again for MLP (RGBlock expects 4D input)
+            seq = einops.rearrange(x, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
+            # seq_norm = self.norm2(seq)  # (B, S, hidden_dim)
+            # Reshape to 4D for RGBlock
+            x_mlp = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)  # (B, hidden_dim, H, W)
+            x_mlp = self.mlp(x_mlp)  # (B, hidden_dim, H, W)
+            # Add back with drop path
+            x = x + self.drop_path(x_mlp)  # (B, hidden_dim, H, W)
 
-        # The explicit MLP branch that was here has been removed.
-        # If it were present, it would typically process 'output'.
+        return x
 
-        return output
+
+
+# class ViLFusionBlock(nn.Module):
+#     def __init__(
+#         self,
+#         in_channels: int,
+#         hidden_dim: int,
+#         config: dict, # Configuration dict, expected to contain 'seqlens', 'chunk_size', etc.
+#         n: int = 1,   # Number of ViLBlockPairBlock repetitions
+#         drop_path: float = 0.0,
+#     ):
+#         """
+#         Initialize the ViLFusionBlock.
+#         The explicit MLP branch has been removed as ViLLayer (within ViLBlockPairBlock)
+#         now contains its own FFN (RGBlock).
+
+#         Args:
+#             in_channels (int): Number of input channels.
+#             hidden_dim (int): Hidden dimension after projection and for ViL blocks.
+#             config (dict): Configuration dict passed to ViLBlockPairBlock.
+#                            Expected to contain 'seqlens', 'chunk_size', 'conv_kind', 'qkv_block_size'.
+#                            Note: Any 'mlp_ratio' in this config for ViLFusionBlock's own MLP
+#                            is no longer used by ViLFusionBlock directly. If this ratio was
+#                            intended to control the FFN inside ViLLayer, ViLBlockPairBlock
+#                            and ViLLayer would need adaptation to use it (e.g., as ffn_proj_factor).
+#             n (int): Number of ViLBlockPairBlock repetitions.
+#             drop_path (float): Drop path probability for stochastic depth.
+#         """
+#         super().__init__()
+
+#         seqlens = config.get("seqlens")
+#         if not seqlens or not isinstance(seqlens, (list, tuple)) or len(seqlens) not in [2, 3]:
+#             # Assuming seqlens might be 3D for some video-like tasks, though typically [H,W] for images.
+#             # The ViLLayer in the canvas expects seqlens=[H,W] for its RGBlock FFN.
+#             LOGGER.warning(f"ViLFusionBlock: 'seqlens' in config is {seqlens}. Expected list/tuple of length 2 (H,W) for RGBlock in ViLLayer.")
+#             # Depending on strictness, you might raise ValueError here.
+#             # For now, we'll proceed, assuming ViLBlockPairBlock/ViLLayer handle it or it's correctly [H,W].
+
+#         self.seqlens = seqlens # Store for reference, primarily used by components within self.vil
+#         self.hidden_dim = hidden_dim
+
+#         # Input projection: projects input to hidden_dim if channels differ
+#         self.in_proj = (
+#             nn.Sequential(
+#                 nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
+#                 nn.BatchNorm2d(hidden_dim),
+#                 nn.SiLU()
+#             ) if in_channels != hidden_dim else nn.Identity()
+#         )
+
+#         # Local spatial processing block (e.g., a 3x3 depthwise conv)
+#         self.lsblock = LSBlock(hidden_dim, hidden_dim) # Assuming LSBlock takes (in_channels, out_channels)
+
+#         # Normalization for sequence input (currently not used in the forward pass provided)
+#         # If re-enabled, ensure RMSNorm is correctly defined and imported.
+#         # self.norm = nn.RMSNorm(hidden_dim, eps=1e-3, elementwise_affine=True)
+
+#         # Sequence processing part using ViLBlockPairBlock
+#         # ViLBlockPairBlock internally uses ViLLayer, which now has the RGBlock FFN.
+#         self.vil = nn.Sequential(*[
+#             ViLBlockPairBlock(hidden_dim, hidden_dim, config) # Pass hidden_dim and config
+#             for _ in range(n)
+#         ])
+
+#         # DropPath for stochastic depth
+#         self.drop_path = DropPath(drop_prob=drop_path) if drop_path > 0.0 else nn.Identity()
+
+#         # The explicit MLP branch (self.norm2, self.mlp with RGBlock) has been removed.
+
+#     def forward(self, x: torch.Tensor) -> torch.Tensor:
+#         """
+#         Forward pass for ViLFusionBlock.
+
+#         Args:
+#             x (torch.Tensor): Input tensor of shape (B, C_in, H, W).
+
+#         Returns:
+#             torch.Tensor: Output tensor of shape (B, hidden_dim, H, W).
+#         """
+#         # Input projection
+#         x_projected = self.in_proj(x)  # Shape: (B, hidden_dim, H, W)
+
+#         # Local spatial processing
+#         x_local_processed = self.lsblock(x_projected)  # Shape: (B, hidden_dim, H, W)
+
+#         # Flatten for sequence processing: (B, hidden_dim, H, W) -> (B, H*W, hidden_dim)
+#         B, C, H, W = x_local_processed.shape # C is hidden_dim here
+#         # For clarity, let's use x_for_sequence to denote the input to the ViL part
+#         x_for_sequence = x_local_processed 
+#         seq_input = einops.rearrange(x_for_sequence, "b c h w -> b (h w) c")
+
+#         # Optional normalization before ViL blocks (currently commented out in original)
+#         # if hasattr(self, 'norm') and self.norm is not None:
+#         #     seq_input = self.norm(seq_input)
+
+#         # Process with ViLBlockPairBlocks (which contain ViLLayers with FFNs)
+#         seq_output_vil = self.vil(seq_input)  # Shape: (B, S, hidden_dim)
+
+#         # Residual connection in sequence space (around the ViL blocks)
+#         # Adds input to ViL block (seq_input) to its output (seq_output_vil)
+#         seq_after_residual = seq_input + self.drop_path(seq_output_vil)
+
+#         # Reshape back to 4D image format: (B, S, hidden_dim) -> (B, hidden_dim, H, W)
+#         x_global_vil_image = einops.rearrange(seq_after_residual, "b (h w) c -> b c h w", h=H, w=W)
+
+#         # Combine local path (output of lsblock) and global path (output of ViL processing)
+#         # The original code added x_local_processed + drop_path(x_global_vil_image)
+#         # This effectively means: out_lsblock + out_vil_path
+#         # If x_projected was intended as the other branch of the residual for x_global_vil_image,
+#         # it would be x_projected + drop_path(x_global_vil_image).
+#         # Sticking to the pattern from the provided code:
+#         output = x_local_processed + self.drop_path(x_global_vil_image)
+#         # This combines the output of the local spatial block with the output of the
+#         # ViL sequence processing blocks.
+
+#         # The explicit MLP branch that was here has been removed.
+#         # If it were present, it would typically process 'output'.
+
+#         return output
 
 # Definition of the PatchMerger class
 class PatchMerger(nn.Module):

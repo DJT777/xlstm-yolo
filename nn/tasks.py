@@ -283,21 +283,64 @@ class BaseModel(torch.nn.Module):
             m.anchors = fn(m.anchors)
             m.strides = fn(m.strides)
         return self
+    
 
     def load(self, weights, verbose=True):
-        """
-        Load the weights into the model.
+        model = weights["model"] if isinstance(weights, dict) else weights
+        csd = model.float().state_dict()
+        own_state = self.state_dict()
+        to_load = {}
 
-        Args:
-            weights (dict | torch.nn.Module): The pre-trained weights to be loaded.
-            verbose (bool, optional): Whether to log the transfer progress. Defaults to True.
-        """
-        model = weights["model"] if isinstance(weights, dict) else weights  # torchvision models are not dicts
-        csd = model.float().state_dict()  # checkpoint state_dict as FP32
-        csd = intersect_dicts(csd, self.state_dict())  # intersect
-        self.load_state_dict(csd, strict=False)  # load
+        for k, v in csd.items():
+            if k in own_state:
+                if v.shape == own_state[k].shape:
+                    to_load[k] = v
+                # Special case for positional embedding interpolation
+                elif "embed" in k and len(v.shape) == len(own_state[k].shape):
+                    # Assume v: [1, H_old, W_old, dim], own_state[k]: [1, H_new, W_new, dim]
+                    v_interp = v
+                    # Try to interpolate positional embedding if needed
+                    try:
+                        print("interpolating")
+                        v_interp = torch.nn.functional.interpolate(
+                            v.permute(0, 3, 1, 2),  # [1, dim, H_old, W_old]
+                            size=own_state[k].shape[1:3],  # (H_new, W_new)
+                            mode='bicubic',
+                            align_corners=False
+                        ).permute(0, 2, 3, 1)  # [1, H_new, W_new, dim]
+                        print(f"Interpolation suceeded for {k}")
+                    except Exception as e:
+                        if verbose:
+                            print(f"Interpolation failed for {k}: {e}")
+                        continue
+                    if v_interp.shape == own_state[k].shape:
+                        to_load[k] = v_interp
+                    else:
+                        if verbose:
+                            print(f"Shape mismatch after interpolation for {k}: got {v_interp.shape}, expected {own_state[k].shape}")
+                else:
+                    if verbose:
+                        print(f"Skipping {k}, shape mismatch: {v.shape} vs {own_state[k].shape}")
+
+        self.load_state_dict(to_load, strict=False)
         if verbose:
-            LOGGER.info(f"Transferred {len(csd)}/{len(self.model.state_dict())} items from pretrained weights")
+            LOGGER.info(f"Transferred {len(to_load)}/{len(own_state)} items from pretrained weights")
+
+
+    # def load(self, weights, verbose=True):
+    #     """
+    #     Load the weights into the model.
+
+    #     Args:
+    #         weights (dict | torch.nn.Module): The pre-trained weights to be loaded.
+    #         verbose (bool, optional): Whether to log the transfer progress. Defaults to True.
+    #     """
+    #     model = weights["model"] if isinstance(weights, dict) else weights  # torchvision models are not dicts
+    #     csd = model.float().state_dict()  # checkpoint state_dict as FP32
+    #     csd = intersect_dicts(csd, self.state_dict())  # intersect
+    #     self.load_state_dict(csd, strict=False)  # load
+    #     if verbose:
+    #         LOGGER.info(f"Transferred {len(csd)}/{len(self.model.state_dict())} items from pretrained weights")
 
     def loss(self, batch, preds=None):
         """
@@ -353,7 +396,7 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 256 # 2x min stride
+            s = 640 # 2x min stride
             m.inplace = self.inplace
 
             def _forward(x):
