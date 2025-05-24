@@ -396,7 +396,7 @@ class DetectionModel(BaseModel):
         # Build strides
         m = self.model[-1]  # Detect()
         if isinstance(m, Detect):  # includes all Detect subclasses like Segment, Pose, OBB, YOLOEDetect, YOLOESegment
-            s = 640 # 2x min stride
+            s = 224 # 2x min stride
             m.inplace = self.inplace
 
             def _forward(x):
@@ -745,6 +745,8 @@ class RTDETRDetectionModel(DetectionModel):
         return sum(loss.values()), torch.as_tensor(
             [loss[k].detach() for k in ["loss_giou", "loss_class", "loss_bbox"]], device=img.device
         )
+
+        
 
     def predict(self, x, profile=False, visualize=False, batch=None, augment=False, embed=None):
         """
@@ -1176,7 +1178,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
             C2fCIB,
             A2C2f,
             VisionLSTM,
-            VisionLSTMTorch,
+            #VisionLSTMTorch,
             #FeatureSplitIndex,
             # Removed custom modules that don't require c1 prepending
             # VitPatchEmbedBlock,  # Already commented out
@@ -1241,7 +1243,7 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
                 legacy = False
                 if scale in "lx":  # For L/X sizes
                     args.extend((True, 1.2))
-        elif m in {VitPatchEmbedBlock, SequenceConv2dBlock}:
+        elif m in {VitPatchEmbedBlock, SequenceConv2dBlock, VisionLSTMTorch}:
             c1 = args[0]  # Input channels from args
             c2 = args[1]  # Output channels from args
             # Use args as is, no prepending of c1

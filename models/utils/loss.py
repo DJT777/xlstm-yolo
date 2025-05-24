@@ -31,7 +31,7 @@ class DETRLoss(nn.Module):
     """
 
     def __init__(
-        self, nc=80, loss_gain=None, aux_loss=True, use_fl=True, use_vfl=False, use_uni_match=False, uni_match_ind=0
+        self, nc=80, loss_gain=None, aux_loss=True, use_fl=False, use_vfl=True, use_uni_match=False, uni_match_ind=0
     ):
         """
         Initialize DETR loss function with customizable components and gains.
@@ -80,8 +80,11 @@ class DETRLoss(nn.Module):
             else:
                 loss_cls = self.fl(pred_scores, one_hot.float())
             loss_cls /= max(num_gts, 1) / nq
+            # loss_cls = loss_cls.sum() / max(num_gts, 1)
         else:
             loss_cls = nn.BCEWithLogitsLoss(reduction="none")(pred_scores, gt_scores).mean(1).sum()  # YOLO CLS loss
+                # loss_cls = nn.BCEWithLogitsLoss(reduction="none")(pred_scores, gt_scores)
+                # loss_cls = loss_cls.sum() / max(num_gts, 1)
 
         return {name_class: loss_cls.squeeze() * self.loss_gain["class"]}
 

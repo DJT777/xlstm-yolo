@@ -452,20 +452,135 @@ class ViLLayerFusedQKV(nn.Module):
         self.ffn.reset_parameters()
 
 
+# class RefactoredxLSTMCrossReader(nn.Module):
+#     """
+#     Cross-attention xLSTM Reader: FusedQKV-like structure, with directionality and strict masking.
+#     """
+#     def __init__(self,
+#                  dim,
+#                  expansion=2,
+#                  qkv_block_size=32,
+#                  proj_bias=True,
+#                  norm_bias=True,
+#                  num_blocks=1,  # kept for API compatibility, unused
+#                  gate_soft_cap=15.0,
+#                  chunk_size=64,
+#                  direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT
+#     ):
+#         super().__init__()
+#         assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+#         self.dim = dim
+#         self.expansion = expansion
+#         self.qkv_block_size = qkv_block_size
+#         self.gate_soft_cap = gate_soft_cap
+#         self.num_blocks = num_blocks
+#         self.direction = direction
+
+#         inner_dim = expansion * dim
+#         num_heads = inner_dim // qkv_block_size
+#         self.inner_dim = inner_dim
+#         self.num_heads = num_heads
+
+#         # Q, K, V projections
+#         self.q_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+#         self.k_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+#         self.v_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+
+#         self.mlstm_cell = MatrixLSTMCell(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             norm_bias=norm_bias,
+#             eps=1e-5,
+#             chunk_size=chunk_size,
+#             gate_soft_cap=gate_soft_cap
+#         )
+
+#         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
+#         self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn = FeedForward(
+#             embedding_dim=dim,
+#             ffn_proj_factor=2.6667,  # or make this an argument, if desired
+#             ffn_round_up_to_multiple_of=64,
+#             use_bias=proj_bias,
+#             weight_mode="fused",
+#             num_blocks=1,
+#         )
+#         self.reset_parameters()
+
+#     def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+#         # Apply directionality: reverse memory if specified
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             memory = memory.flip(1)
+#         x = torch.cat([memory, queries], dim=1)  # (B, N_mem + N_q, D)
+
+#         residual = x
+#         x = self.norm(x)
+
+#         q = self.q_proj(x)
+#         k = self.k_proj(x)
+#         v = self.v_proj(x)
+
+#         N_mem = memory.size(1)
+#         # Mask out query positions in k/v (strict cross-attention, only memory writes)
+#         if N_mem < x.shape[1]:
+#             k[:, N_mem:, :] = 0.0
+#             v[:, N_mem:, :] = 0.0
+
+#         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+#         x_mlstm = self.proj_down(h_tilde_state)
+
+#         x = residual + x_mlstm
+#         ffn_residual = x
+#         x_ffn = self.ffn_norm(x)
+#         x_ffn = self.ffn(x_ffn)
+#         x = ffn_residual + x_ffn
+
+#         # Output only the query portion, without flipping
+#         out = x[:, N_mem:, :]
+#         return out
+
+#     def reset_parameters(self):
+#         nn.init.xavier_uniform_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
+#         nn.init.xavier_uniform_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
+#         nn.init.xavier_uniform_(self.v_proj.weight); nn.init.zeros_(self.v_proj.bias)
+#         nn.init.xavier_uniform_(self.proj_down.weight); nn.init.zeros_(self.proj_down.bias)
+#         self.mlstm_cell.reset_parameters()
+#         self.norm.reset_parameters()
+#         self.ffn_norm.reset_parameters()
+#         self.ffn.reset_parameters()
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+
+
+#zeroing K,V on queries for "read only"
 class RefactoredxLSTMCrossReader(nn.Module):
     """
-    Cross-attention xLSTM Reader: FusedQKV-like structure, with directionality and strict masking.
+    Cross-attention xLSTM Reader with:
+    - Convolutional processing of memory tokens (spatial grid, e.g. image patches)
+    - Strict cross-attention: queries read from memory, but not each other
+    - FFN is applied only to the query outputs
+    - Supports independent direction (traversal order) for both memory and query
     """
-    def __init__(self,
-                 dim,
-                 expansion=2,
-                 qkv_block_size=32,
-                 proj_bias=True,
-                 norm_bias=True,
-                 num_blocks=1,  # kept for API compatibility, unused
-                 gate_soft_cap=15.0,
-                 chunk_size=64,
-                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT
+    def __init__(
+        self,
+        dim,
+        expansion=2,
+        qkv_block_size=32,
+        proj_bias=True,
+        norm_bias=True,
+        conv_bias=True,
+        conv_kernel_size=3,
+        conv_kind="2d",
+        seqlens=None,  # Needed for SequenceConv2d
+        gate_soft_cap=15.0,
+        chunk_size=64,
+        memory_direction=None,
+        query_direction=None,
     ):
         super().__init__()
         assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
@@ -473,34 +588,48 @@ class RefactoredxLSTMCrossReader(nn.Module):
         self.expansion = expansion
         self.qkv_block_size = qkv_block_size
         self.gate_soft_cap = gate_soft_cap
-        self.num_blocks = num_blocks
-        self.direction = direction
+        self.memory_direction = memory_direction
+        self.query_direction = query_direction
 
         inner_dim = expansion * dim
         num_heads = inner_dim // qkv_block_size
         self.inner_dim = inner_dim
         self.num_heads = num_heads
 
-        # Q, K, V projections
-        self.q_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
-        self.k_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
-        self.v_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+        # Projections for memory
+        self.memory_proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
 
+        # Convolution for memory (Q/K only, ViL style)
+        assert conv_kind == "2d", "Only 2D convolution is implemented in this example."
+        assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
+        self.memory_conv = SequenceConv2d(
+            inner_dim, inner_dim, kernel_size=conv_kernel_size,
+            padding=conv_kernel_size // 2, groups=inner_dim,
+            bias=conv_bias, seqlens=seqlens
+        )
+
+        self.memory_qk_proj = nn.Linear(inner_dim, 2 * inner_dim, bias=proj_bias)
+        self.memory_v_proj = nn.Linear(inner_dim, inner_dim, bias=proj_bias)
+
+        # Query projections (NO convolution for queries, since they're not spatial)
+        self.query_q_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+        
+
+        # mLSTM cell (fused QKV logic)
         self.mlstm_cell = MatrixLSTMCell(
             dim=inner_dim,
             num_heads=num_heads,
             norm_bias=norm_bias,
             eps=1e-5,
             chunk_size=chunk_size,
-            gate_soft_cap=gate_soft_cap
+            gate_soft_cap=gate_soft_cap,
         )
 
         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
-        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
         self.ffn = FeedForward(
             embedding_dim=dim,
-            ffn_proj_factor=2.6667,  # or make this an argument, if desired
+            ffn_proj_factor=2.6667,
             ffn_round_up_to_multiple_of=64,
             use_bias=proj_bias,
             weight_mode="fused",
@@ -509,46 +638,204 @@ class RefactoredxLSTMCrossReader(nn.Module):
         self.reset_parameters()
 
     def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
-        # Apply directionality: reverse memory if specified
-        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+        """
+        memory: (B, N_mem, D)  # Spatial grid, e.g. flattened H*W patches
+        queries: (B, N_q, D)   # Query features (no spatial structure)
+        Returns:
+            out: (B, N_q, D)
+        """
+        B, N_mem, D = memory.shape
+        Bq, N_q, Dq = queries.shape
+        assert B == Bq and D == Dq
+
+        # ---- DIRECTIONALITY ----
+        # Flip memory if specified
+        if self.memory_direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
             memory = memory.flip(1)
-        x = torch.cat([memory, queries], dim=1)  # (B, N_mem + N_q, D)
+        # Flip queries if specified
+        if self.query_direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            queries = queries.flip(1)
 
-        residual = x
-        x = self.norm(x)
+        # 1. Project up and split memory into QK/V branches
+        memory_proj = self.memory_proj_up(memory)  # (B, N_mem, 2*inner_dim)
+        memory_qk, memory_v = torch.chunk(memory_proj, 2, dim=-1)  # (B, N_mem, inner_dim)
 
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
+        # 2. Convolutional activation (ViL style) on memory QK only
+        memory_qk_conv = F.silu(self.memory_conv(memory_qk))  # (B, N_mem, inner_dim)
 
-        N_mem = memory.size(1)
-        # Mask out query positions in k/v (strict cross-attention, only memory writes)
-        if N_mem < x.shape[1]:
-            k[:, N_mem:, :] = 0.0
-            v[:, N_mem:, :] = 0.0
+        # 3. Final QK/V projections for memory
+        mem_qk_proj = self.memory_qk_proj(memory_qk_conv)  # (B, N_mem, 2*inner_dim)
+        mem_q, mem_k = torch.chunk(mem_qk_proj, 2, dim=-1)
+        mem_v = self.memory_v_proj(memory_v)
 
+        # 4. Prepare queries: only Q projection, no convolution
+        query_q = self.query_q_proj(queries)  # (B, N_q, inner_dim)
+
+        # 5. Concatenate memory and queries for joint mLSTM processing
+        q = torch.cat([mem_q, query_q], dim=1)  # (B, N_mem + N_q, inner_dim)
+        k = torch.cat([mem_k, torch.zeros_like(query_q)], dim=1)  # Zero-out K for queries
+        v = torch.cat([mem_v, torch.zeros_like(query_q)], dim=1)  # Zero-out V for queries
+
+        # 6. Run through mLSTM cell
         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
         x_mlstm = self.proj_down(h_tilde_state)
 
-        x = residual + x_mlstm
-        ffn_residual = x
-        x_ffn = self.ffn_norm(x)
-        x_ffn = self.ffn(x_ffn)
-        x = ffn_residual + x_ffn
+        # 7. Output only the query portion (last N_q tokens)
+        query_out = x_mlstm[:, N_mem:, :]  # (B, N_q, D)
 
-        # Output only the query portion, without flipping
-        out = x[:, N_mem:, :]
-        return out
+        # Flip query output back if needed
+        if self.query_direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            query_out = query_out.flip(1)
+
+        # 8. Apply FFN and normalization only to query tokens
+        query_out = self.ffn_norm(query_out)
+        query_out = self.ffn(query_out)
+
+        return query_out
 
     def reset_parameters(self):
-        nn.init.xavier_uniform_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
-        nn.init.xavier_uniform_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
-        nn.init.xavier_uniform_(self.v_proj.weight); nn.init.zeros_(self.v_proj.bias)
+        nn.init.xavier_uniform_(self.memory_proj_up.weight); nn.init.zeros_(self.memory_proj_up.bias)
+        nn.init.xavier_uniform_(self.memory_qk_proj.weight); nn.init.zeros_(self.memory_qk_proj.bias)
+        nn.init.xavier_uniform_(self.memory_v_proj.weight); nn.init.zeros_(self.memory_v_proj.bias)
+        nn.init.xavier_uniform_(self.query_q_proj.weight); nn.init.zeros_(self.query_q_proj.bias)
         nn.init.xavier_uniform_(self.proj_down.weight); nn.init.zeros_(self.proj_down.bias)
         self.mlstm_cell.reset_parameters()
-        self.norm.reset_parameters()
         self.ffn_norm.reset_parameters()
         self.ffn.reset_parameters()
+
+
+# class RefactoredxLSTMCrossReader(nn.Module):
+#     """
+#     Cross-attention xLSTM Reader with convolutional processing of memory tokens (spatial grid)
+#     and strict cross-attention from query tokens to memory tokens only. FFN is applied only to
+#     the query outputs for efficiency.
+#     """
+#     def __init__(
+#         self,
+#         dim,
+#         expansion=2,
+#         qkv_block_size=32,
+#         proj_bias=True,
+#         norm_bias=True,
+#         conv_bias=True,
+#         conv_kernel_size=3,
+#         conv_kind="2d",
+#         seqlens=None,  # Needed for SequenceConv2d
+#         gate_soft_cap=15.0,
+#         chunk_size=64,
+#         direction=None,
+#     ):
+#         super().__init__()
+#         assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+#         self.dim = dim
+#         self.expansion = expansion
+#         self.qkv_block_size = qkv_block_size
+#         self.gate_soft_cap = gate_soft_cap
+#         self.direction = direction
+
+#         inner_dim = expansion * dim
+#         num_heads = inner_dim // qkv_block_size
+#         self.inner_dim = inner_dim
+#         self.num_heads = num_heads
+
+#         # Projections for memory
+#         self.memory_proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
+
+#         # Convolution for memory (Q/K only, ViL style)
+#         assert conv_kind == "2d", "Only 2D convolution is implemented in this example."
+#         assert conv_kernel_size % 2 == 1, "conv_kernel_size must be odd for 2d conv"
+#         self.memory_conv = SequenceConv2d(
+#             inner_dim, inner_dim, kernel_size=conv_kernel_size,
+#             padding=conv_kernel_size // 2, groups=inner_dim,
+#             bias=conv_bias, seqlens=seqlens
+#         )
+
+#         self.memory_qk_proj = nn.Linear(inner_dim, 2 * inner_dim, bias=proj_bias)
+#         self.memory_v_proj = nn.Linear(inner_dim, inner_dim, bias=proj_bias)
+
+#         # Query projections (NO convolution for queries, since they're not spatial)
+#         self.query_q_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+
+#         # mLSTM cell (fused QKV logic)
+#         self.mlstm_cell = MatrixLSTMCell(
+#             dim=inner_dim,
+#             num_heads=num_heads,
+#             norm_bias=norm_bias,
+#             eps=1e-5,
+#             chunk_size=chunk_size,
+#             gate_soft_cap=gate_soft_cap,
+#         )
+
+#         self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
+#         self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+#         self.ffn = FeedForward(
+#             embedding_dim=dim,
+#             ffn_proj_factor=2.6667,
+#             ffn_round_up_to_multiple_of=64,
+#             use_bias=proj_bias,
+#             weight_mode="fused",
+#             num_blocks=1,
+#         )
+#         self.reset_parameters()
+
+#     def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
+#         """
+#         memory: (B, N_mem, D)  # Spatial grid, e.g. flattened H*W patches, with known arrangement
+#         queries: (B, N_q, D)   # Query features (no spatial structure)
+#         Returns:
+#             out: (B, N_q, D)
+#         """
+#         B, N_mem, D = memory.shape
+#         Bq, N_q, Dq = queries.shape
+#         assert B == Bq and D == Dq
+
+#         # Handle directionality for memory if needed
+#         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+#             memory = memory.flip(1)
+
+#         # 1. Project up and split memory into QK/V branches
+#         memory_proj = self.memory_proj_up(memory)  # (B, N_mem, 2*inner_dim)
+#         memory_qk, memory_v = torch.chunk(memory_proj, 2, dim=-1)  # (B, N_mem, inner_dim)
+
+#         # 2. Convolutional activation (ViL style) **on memory QK only**
+#         memory_qk_conv = F.silu(self.memory_conv(memory_qk))  # (B, N_mem, inner_dim)
+
+#         # 3. Final QK/V projections for memory
+#         mem_qk_proj = self.memory_qk_proj(memory_qk_conv)  # (B, N_mem, 2*inner_dim)
+#         mem_q, mem_k = torch.chunk(mem_qk_proj, 2, dim=-1)
+#         mem_v = self.memory_v_proj(memory_v)
+
+#         # 4. Prepare queries: only Q projection, no convolution
+#         query_q = self.query_q_proj(queries)  # (B, N_q, inner_dim)
+
+#         # 5. Concatenate memory and queries for joint mLSTM processing
+#         q = torch.cat([mem_q, query_q], dim=1)  # (B, N_mem + N_q, inner_dim)
+#         k = torch.cat([mem_k, torch.zeros_like(query_q)], dim=1)  # Zero-out K for queries
+#         v = torch.cat([mem_v, torch.zeros_like(query_q)], dim=1)  # Zero-out V for queries
+
+#         # 6. Run through mLSTM cell
+#         h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)
+#         x_mlstm = self.proj_down(h_tilde_state)
+
+#         # 7. Output only the query portion (last N_q tokens)
+#         query_out = x_mlstm[:, N_mem:, :]  # (B, N_q, D)
+
+#         # 8. Apply FFN and normalization only to query tokens
+#         query_out = self.ffn_norm(query_out)
+#         query_out = self.ffn(query_out)
+
+#         return query_out
+
+#     def reset_parameters(self):
+#         nn.init.xavier_uniform_(self.memory_proj_up.weight); nn.init.zeros_(self.memory_proj_up.bias)
+#         nn.init.xavier_uniform_(self.memory_qk_proj.weight); nn.init.zeros_(self.memory_qk_proj.bias)
+#         nn.init.xavier_uniform_(self.memory_v_proj.weight); nn.init.zeros_(self.memory_v_proj.bias)
+#         nn.init.xavier_uniform_(self.query_q_proj.weight); nn.init.zeros_(self.query_q_proj.bias)
+#         nn.init.xavier_uniform_(self.proj_down.weight); nn.init.zeros_(self.proj_down.bias)
+#         self.mlstm_cell.reset_parameters()
+#         self.ffn_norm.reset_parameters()
+#         self.ffn.reset_parameters()
+
 
 
 #GPT 4.5 refactor
@@ -620,7 +907,7 @@ class MatrixLSTMCell(nn.Module):
         # Fused ifgate projection
         self.ifgate = nn.Linear(3 * dim, 2 * num_heads)
 
-        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-3)
+        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
         self.causal_mask_cache = {}
         self.chunk_size = chunk_size
 

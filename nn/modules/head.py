@@ -1410,219 +1410,1182 @@ from .vision_lstm.vision_lstm2 import *
 #             return out, (dec_boxes, dec_scores, enc_boxes, enc_scores, dn_meta)
 
 
-class ViLBasedRTDETRHead(nn.Module):
-    """RT-DETR head using ViLLayerFusedQKV writers + strict-masking xLSTM readers with directionality."""
-    export = False
+# class ViLBasedRTDETRHead(nn.Module):
+#     """RT-DETR head using ViLLayerFusedQKV writers + strict-masking xLSTM readers with directionality."""
+#     export = False
 
+#     def __init__(
+#         self,
+#         ch_vil,
+#         vil_fpn_spatial_shapes,
+#         hidden_dim=256,
+#         num_queries=300,
+#         num_vil_self_attn_layers=2,
+#         vil_block_decoder_args=None,
+#         act=nn.SiLU, 
+#         nc=80,
+#         num_denoising=0,
+#         label_noise_ratio=0.5,
+#         box_noise_scale=1.0,
+#         grid_size_anchor=0.05,
+#         return_intermediate_outputs=False,
+#     ):
+#         super().__init__()
+#         self.nc, self.hidden_dim = int(nc), int(hidden_dim)
+#         self.num_queries, self.num_denoising = int(num_queries), int(num_denoising)
+#         self.grid_size_anchor = grid_size_anchor
+
+#         self.input_proj = nn.ModuleList(
+#             nn.Sequential(nn.Linear(c, hidden_dim), nn.LayerNorm(hidden_dim)) for c in ch_vil
+#         )
+#         self.register_buffer("vil_fpn_spatial_shapes",
+#                              torch.tensor(vil_fpn_spatial_shapes, dtype=torch.long),
+#                              persistent=False)
+
+#         self.proposal_feature_transform = nn.Sequential(
+#             nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim)
+#         )
+#         self.proposal_score_head = nn.Linear(hidden_dim, nc)
+#         self.proposal_box_head   = MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU)
+
+#         base_cfg = dict(
+#             dim=hidden_dim,
+#             expansion=2,
+#             qkv_block_size=max(1, hidden_dim // 64 if hidden_dim >= 64 else hidden_dim // 16),
+#             proj_bias=True,
+#             norm_bias=True,
+#             num_blocks=1,
+#             gate_soft_cap=15.0,
+#             chunk_size=64,
+#         )
+#         if vil_block_decoder_args is not None:
+#             base_cfg.update(vil_block_decoder_args)
+#         if hidden_dim % base_cfg["qkv_block_size"]:
+#             base_cfg["qkv_block_size"] = next(
+#                 (d for d in (16, 32, 64, 128, 256) if hidden_dim % d == 0), 1
+#             )
+
+#         self.writer = nn.ModuleList(
+#             ViLLayerFusedQKV(
+#                 **base_cfg,
+#                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
+#             ) for i in range(num_vil_self_attn_layers)
+#         )
+#         self.reader = nn.ModuleList(
+#             RefactoredxLSTMCrossReader(
+#                 dim=hidden_dim,
+#                 expansion=base_cfg["expansion"],
+#                 qkv_block_size=base_cfg["qkv_block_size"],
+#                 chunk_size=base_cfg["chunk_size"],
+#                 gate_soft_cap=base_cfg["gate_soft_cap"],
+#                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
+#             ) for i in range(num_vil_self_attn_layers)
+#         )
+
+#         n_sets = max(1, num_vil_self_attn_layers) if return_intermediate_outputs else 1
+#         self.final_score_heads = nn.ModuleList(nn.Linear(hidden_dim, nc) for _ in range(n_sets))
+#         self.final_box_heads = nn.ModuleList(
+#             MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU) for _ in range(n_sets)
+#         )
+#         self.denoising_class_embed = nn.Embedding(nc, hidden_dim) if self.num_denoising else None
+#         self.label_noise_ratio, self.box_noise_scale = label_noise_ratio, box_noise_scale
+#         self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2, act=nn.SiLU)
+#         self._reset_parameters()
+
+#     def _reset_parameters(self):
+#         bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear) and m.weight.requires_grad:
+#                 nn.init.xavier_uniform_(m.weight)
+#         for h in self.final_score_heads:
+#             constant_(h.bias, bias_cls)
+#         for m in self.final_box_heads:
+#             constant_(m.layers[-1].weight, 0.0)
+#             constant_(m.layers[-1].bias,   0.0)
+
+#     @staticmethod
+#     def _meshgrid(H, W, dtype, device):
+#         y, x = torch.arange(H, dtype=dtype, device=device), torch.arange(W, dtype=dtype, device=device)
+#         gy, gx = torch.meshgrid(y, x, indexing="ij")
+#         return gx, gy
+
+#     def _anchors(self, dtype, device):
+#         shapes = self.vil_fpn_spatial_shapes.to(device)
+#         out = []
+#         for i, (H, W) in enumerate(shapes):
+#             gx, gy = self._meshgrid(int(H), int(W), dtype, device)
+#             cxcy = (torch.stack([gx, gy], -1).float() + 0.5) / torch.tensor([W, H], dtype=dtype, device=device)
+#             wh   = torch.full_like(cxcy, self.grid_size_anchor * (2.0 ** i))
+#             out.append(torch.cat([cxcy, wh], -1).view(-1, 4))
+#         return torch.cat(out).unsqueeze(0)
+
+#     def _initial_queries(self, feats, batch):
+#         seqs = [
+#             proj_layer(f.permute(0, 2, 3, 1).reshape(f.size(0), -1, f.size(1)))
+#             for f, proj_layer in zip(feats, self.input_proj)
+#         ]
+#         cat = torch.cat(seqs, 1)
+#         bs, ntok, _ = cat.shape
+#         anchors = self._anchors(cat.dtype, cat.device).repeat(bs, 1, 1)
+
+#         dense = self.proposal_feature_transform(cat)
+#         score = self.proposal_score_head(dense)
+#         delta = self.proposal_box_head(dense)
+
+#         ref_cxcy, ref_wh = anchors[..., :2], anchors[..., 2:]
+#         boxes = torch.cat([ref_cxcy + delta[..., :2] * ref_wh,
+#                            ref_wh * torch.exp(delta[..., 2:])], -1).sigmoid()
+
+#         k = max(1, min(self.num_queries, ntok))
+#         topk = score.sigmoid().amax(-1).topk(k, 1).indices
+#         gather = lambda t, d: torch.gather(t, 1, topk.unsqueeze(-1).expand(-1, -1, d))
+#         sel_feat, sel_box, sel_score = gather(cat, self.hidden_dim), gather(boxes, 4), gather(score, self.nc)
+
+#         dn_meta = dict(
+#             num_denoising_queries=0,
+#             num_matching_queries=k,
+#             dn_num_split=[0, k],
+#             dn_pos_idx=[torch.zeros([0], dtype=torch.long, device=cat.device) for _ in range(bs)],
+#             dn_num_group=0
+#         )
+
+#         dn_emb = dn_bbox = None
+#         if self.training and self.num_denoising:
+#             try:
+#                 dn_emb, dn_bbox, _, extra = get_cdn_group(
+#                     batch, self.nc, k, self.denoising_class_embed.weight,
+#                     self.num_denoising, self.label_noise_ratio, self.box_noise_scale, True
+#                 )
+#                 dn_meta.update(extra)
+#                 dn_meta["num_denoising_queries"] = dn_emb.size(1)
+#                 dn_meta["dn_num_split"] = [dn_emb.size(1), k]
+#             except Exception as e:
+#                 warnings.warn(f"CDN disabled: {e}")
+
+#         q_feat = torch.cat([dn_emb, sel_feat], 1) if dn_emb is not None else sel_feat
+#         q_box = torch.cat([dn_bbox, sel_box], 1) if dn_bbox is not None else sel_box
+
+#         if self.training:
+#             q_feat = q_feat.detach()
+#             q_box = q_box.detach()
+
+#         return q_feat, q_box, sel_score, sel_box, dn_meta
+
+#     def forward(self, x, batch=None):
+#         # Prepare queries as before
+#         qf, qb, enc_scores, enc_boxes, dn_meta = (*self._initial_queries(x, batch if self.training else None),)
+#         tgt_dtype = self.query_pos_head.layers[0].weight.dtype
+#         q = qf.to(tgt_dtype) + self.query_pos_head(qb.to(tgt_dtype))
+
+#         # Prepare memory ONCE for all layers (project all FPN feature maps)
+#         projected_feats = [
+#             proj_layer(f.permute(0, 2, 3, 1).reshape(f.size(0), -1, f.size(1)))
+#             for f, proj_layer in zip(x, self.input_proj)
+#         ]
+#         memory = torch.cat(projected_feats, 1)  # (B, N_mem, hidden_dim)
+
+#         dn_len = dn_meta["num_denoising_queries"]
+#         det_len = dn_meta["num_matching_queries"]
+#         dn_queries = q[:, :dn_len, :]
+#         det_queries = q[:, dn_len:, :]
+
+#         cls_all, box_all = [], []
+#         for i in range(len(self.writer)):
+#             # ---- SELF-ATTENTION: process groups independently for perfect symmetry ----
+#             det_queries_ = self.writer[i](det_queries)
+#             if dn_len > 0:
+#                 dn_queries_ = self.writer[i](dn_queries)
+#             else:
+#                 dn_queries_ = dn_queries
+
+#             # ---- CROSS-ATTENTION: process all together (memory is safe to share) ----
+#             all_queries = torch.cat([dn_queries_, det_queries_], dim=1) if dn_len > 0 else det_queries_
+#             all_queries = self.reader[i](memory, all_queries)
+
+#             # ---- SPLIT for next layer ----
+#             if dn_len > 0:
+#                 dn_queries = all_queries[:, :dn_len, :]
+#                 det_queries = all_queries[:, dn_len:, :]
+#             else:
+#                 det_queries = all_queries
+
+#             # ---- Collect head outputs for each layer ----
+#             head_idx = i if i < len(self.final_box_heads) else 0
+#             cls_all.append(self.final_score_heads[head_idx](all_queries))
+#             box_all.append(self.final_box_heads[head_idx](all_queries).sigmoid())
+#         dec_scores, dec_boxes = torch.stack(cls_all), torch.stack(box_all)
+
+#         k = dn_meta["num_matching_queries"]
+#         if self.training:
+#             return dec_boxes, dec_scores, enc_boxes[:, :k], enc_scores[:, :k], dn_meta
+#         else:
+#             if dn_meta["num_denoising_queries"] > 0:
+#                 offset = dn_meta["num_denoising_queries"]
+#                 out = torch.cat([dec_boxes[-1][:, offset:], dec_scores[-1][:, offset:].sigmoid()], -1)
+#             else:
+#                 out = torch.cat([dec_boxes[-1], dec_scores[-1].sigmoid()], -1)
+#             dn_meta = None
+#             return out, (dec_boxes, dec_scores, enc_boxes, enc_scores, dn_meta)
+
+
+# class ViLBasedRTDETRHead(nn.Module):
+#     def __init__(
+#         self,
+#         ch_vil,
+#         vil_fpn_spatial_shapes,
+#         hidden_dim=384,            # <== new fused dimension
+#         num_queries=300,
+#         num_vil_self_attn_layers=2,
+#         vil_block_decoder_args=None,
+#         act=nn.SiLU,
+#         nc=80,
+#         num_denoising=0,
+#         label_noise_ratio=0.5,
+#         box_noise_scale=1.0,
+#         grid_size_anchor=0.05,
+#         return_intermediate_outputs=False,
+#         fuse_out_size=40,         # <== fusion map size
+#     ):
+#         super().__init__()
+#         self.nc, self.hidden_dim = int(nc), int(hidden_dim)
+#         self.num_queries, self.num_denoising = int(num_queries), int(num_denoising)
+#         self.grid_size_anchor = grid_size_anchor
+#         self.fuse_out_size = fuse_out_size
+
+#         # Fusion layer: expects 4 PAFPN outputs with ch_vil[0] channels each (usually 192)
+#         total_in_channels = sum(ch_vil)  # e.g., 256 + 256 + 256 = 768
+#         self.fuse_to_single = nn.Conv2d(total_in_channels, self.hidden_dim, kernel_size=1)
+
+#         # For single-scale mode, we use an Identity projection (no Linear needed)
+#         self.input_proj = nn.ModuleList([nn.Identity()])
+
+#         # Since we fuse to a single scale, we need just one spatial shape for anchors
+#         self.register_buffer(
+#             "vil_fpn_spatial_shapes",
+#             torch.tensor([[fuse_out_size, fuse_out_size]], dtype=torch.long),
+#             persistent=False
+#         )
+
+#         self.proposal_feature_transform = nn.Sequential(
+#             nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim)
+#         )
+#         self.proposal_score_head = nn.Linear(hidden_dim, nc)
+#         self.proposal_box_head   = MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU)
+
+#         base_cfg = dict(
+#             dim=hidden_dim,
+#             expansion=2,
+#             qkv_block_size=max(1, hidden_dim // 64 if hidden_dim >= 64 else hidden_dim // 16),
+#             proj_bias=True,
+#             norm_bias=True,
+#             num_blocks=1,
+#             gate_soft_cap=15.0,
+#             chunk_size=64,
+#         )
+#         if vil_block_decoder_args is not None:
+#             base_cfg.update(vil_block_decoder_args)
+#         if hidden_dim % base_cfg["qkv_block_size"]:
+#             base_cfg["qkv_block_size"] = next(
+#                 (d for d in (16, 32, 64, 128, 256) if hidden_dim % d == 0), 1
+#             )
+
+#         self.writer = nn.ModuleList(
+#             ViLLayerFusedQKV(
+#                 **base_cfg,
+#                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
+#             ) for i in range(num_vil_self_attn_layers)
+#         )
+
+
+#         directions = [
+#             (SequenceTraversal.ROWWISE_FROM_TOP_LEFT,    SequenceTraversal.ROWWISE_FROM_TOP_LEFT),
+#             (SequenceTraversal.ROWWISE_FROM_TOP_LEFT,    SequenceTraversal.ROWWISE_FROM_BOT_RIGHT),
+#             (SequenceTraversal.ROWWISE_FROM_BOT_RIGHT,   SequenceTraversal.ROWWISE_FROM_TOP_LEFT),
+#             (SequenceTraversal.ROWWISE_FROM_BOT_RIGHT,   SequenceTraversal.ROWWISE_FROM_BOT_RIGHT),
+#         ]
+
+
+#         self.reader = nn.ModuleList(
+#             RefactoredxLSTMCrossReader(
+#                 dim=hidden_dim,
+#                 expansion=base_cfg["expansion"],
+#                 qkv_block_size=base_cfg["qkv_block_size"],
+#                 chunk_size=base_cfg["chunk_size"],
+#                 gate_soft_cap=base_cfg["gate_soft_cap"],
+#                 seqlens=[fuse_out_size, fuse_out_size],
+#                 memory_direction=mem_dir,
+#                 query_direction=q_dir,
+#             )
+#             for i, (mem_dir, q_dir) in enumerate(directions[:num_vil_self_attn_layers])
+#         )
+
+#         n_sets = max(1, num_vil_self_attn_layers) if return_intermediate_outputs else 1
+#         self.final_score_heads = nn.ModuleList(nn.Linear(hidden_dim, nc) for _ in range(n_sets))
+#         self.final_box_heads = nn.ModuleList(
+#             MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU) for _ in range(n_sets)
+#         )
+#         self.denoising_class_embed = nn.Embedding(nc, hidden_dim) if self.num_denoising else None
+#         self.label_noise_ratio, self.box_noise_scale = label_noise_ratio, box_noise_scale
+#         self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2, act=nn.SiLU)
+#         self._reset_parameters()
+
+#     def _reset_parameters(self):
+#         bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear) and m.weight.requires_grad:
+#                 nn.init.xavier_uniform_(m.weight)
+#         for h in self.final_score_heads:
+#             constant_(h.bias, bias_cls)
+#         for m in self.final_box_heads:
+#             constant_(m.layers[-1].weight, 0.0)
+#             constant_(m.layers[-1].bias,   0.0)
+
+#     @staticmethod
+#     def _meshgrid(H, W, dtype, device):
+#         y, x = torch.arange(H, dtype=dtype, device=device), torch.arange(W, dtype=dtype, device=device)
+#         gy, gx = torch.meshgrid(y, x, indexing="ij")
+#         return gx, gy
+
+#     def _anchors(self, dtype, device):
+#         shapes = self.vil_fpn_spatial_shapes.to(device)
+#         out = []
+#         for i, (H, W) in enumerate(shapes):
+#             gx, gy = self._meshgrid(int(H), int(W), dtype, device)
+#             cxcy = (torch.stack([gx, gy], -1).float() + 0.5) / torch.tensor([W, H], dtype=dtype, device=device)
+#             wh   = torch.full_like(cxcy, self.grid_size_anchor * (2.0 ** i))
+#             out.append(torch.cat([cxcy, wh], -1).view(-1, 4))
+#         return torch.cat(out).unsqueeze(0)
+
+#     def _initial_queries(self, feats, batch):
+#         # feats: list with one fused feature map [B, hidden_dim, 16, 16]
+#         proj_layer = self.input_proj[0]
+#         f = feats[0]
+#         # flatten: [B, hidden_dim, 16, 16] -> [B, 256, hidden_dim]
+#         seq = proj_layer(f.permute(0,2,3,1).reshape(f.size(0), -1, f.size(1)))
+#         cat = seq
+#         bs, ntok, _ = cat.shape
+#         anchors = self._anchors(cat.dtype, cat.device).repeat(bs, 1, 1)
+
+#         dense = self.proposal_feature_transform(cat)
+#         score = self.proposal_score_head(dense)
+#         delta = self.proposal_box_head(dense)
+
+#         ref_cxcy, ref_wh = anchors[..., :2], anchors[..., 2:]
+#         boxes = torch.cat([ref_cxcy + delta[..., :2] * ref_wh,
+#                            ref_wh * torch.exp(delta[..., 2:])], -1).sigmoid()
+
+#         k = max(1, min(self.num_queries, ntok))
+#         topk = score.sigmoid().amax(-1).topk(k, 1).indices
+#         gather = lambda t, d: torch.gather(t, 1, topk.unsqueeze(-1).expand(-1, -1, d))
+#         sel_feat, sel_box, sel_score = gather(cat, self.hidden_dim), gather(boxes, 4), gather(score, self.nc)
+
+#         dn_meta = dict(
+#             num_denoising_queries=0,
+#             num_matching_queries=k,
+#             dn_num_split=[0, k],
+#             dn_pos_idx=[torch.zeros([0], dtype=torch.long, device=cat.device) for _ in range(bs)],
+#             dn_num_group=0
+#         )
+
+#         dn_emb = dn_bbox = None
+#         if self.training and self.num_denoising:
+#             try:
+#                 dn_emb, dn_bbox, _, extra = get_cdn_group(
+#                     batch, self.nc, k, self.denoising_class_embed.weight,
+#                     self.num_denoising, self.label_noise_ratio, self.box_noise_scale, True
+#                 )
+#                 dn_meta.update(extra)
+#                 dn_meta["num_denoising_queries"] = dn_emb.size(1)
+#                 dn_meta["dn_num_split"] = [dn_emb.size(1), k]
+#             except Exception as e:
+#                 warnings.warn(f"CDN disabled: {e}")
+
+#         q_feat = torch.cat([dn_emb, sel_feat], 1) if dn_emb is not None else sel_feat
+#         q_box = torch.cat([dn_bbox, sel_box], 1) if dn_bbox is not None else sel_box
+
+#         if self.training:
+#             q_feat = q_feat.detach()
+#             q_box = q_box.detach()
+
+#         return q_feat, q_box, sel_score, sel_box, dn_meta
+
+#     def forward(self, x, batch=None):
+#         # --- FUSION: PAFPN multi-scale -> single [B, 384, 16, 16] map ---
+#         resized = [
+#             F.adaptive_avg_pool2d(f, (self.fuse_out_size, self.fuse_out_size)) if f.shape[-1] > self.fuse_out_size
+#             else F.interpolate(f, size=(self.fuse_out_size, self.fuse_out_size), mode='nearest') if f.shape[-1] < self.fuse_out_size
+#             else f
+#             for f in x
+#         ]
+#         fused = torch.cat(resized, dim=1)  # [B, 4*192, 16, 16]
+#         fused = self.fuse_to_single(fused) # [B, 384, 16, 16]
+#         x_fused = [fused]                  # single-map flow
+
+#         # From here, everything is single-scale, just update as usual!
+#         qf, qb, enc_scores, enc_boxes, dn_meta = (*self._initial_queries(x_fused, batch if self.training else None),)
+#         tgt_dtype = self.query_pos_head.layers[0].weight.dtype
+#         q = qf.to(tgt_dtype) + self.query_pos_head(qb.to(tgt_dtype))
+
+#         # Memory is from single 16x16 map (flattened)
+#         memory = fused.permute(0,2,3,1).reshape(fused.size(0), -1, self.hidden_dim)  # [B, 256, 384]
+
+#         dn_len = dn_meta["num_denoising_queries"]
+#         det_len = dn_meta["num_matching_queries"]
+#         dn_queries = q[:, :dn_len, :]
+#         det_queries = q[:, dn_len:, :]
+
+#         cls_all, box_all = [], []
+#         for i in range(len(self.writer)):
+#             det_queries_ = self.writer[i](det_queries)
+#             if dn_len > 0:
+#                 dn_queries_ = self.writer[i](dn_queries)
+#             else:
+#                 dn_queries_ = dn_queries
+
+#             all_queries = torch.cat([dn_queries_, det_queries_], dim=1) if dn_len > 0 else det_queries_
+#             all_queries = self.reader[i](memory, all_queries)
+
+#             if dn_len > 0:
+#                 dn_queries = all_queries[:, :dn_len, :]
+#                 det_queries = all_queries[:, dn_len:, :]
+#             else:
+#                 det_queries = all_queries
+
+#             head_idx = i if i < len(self.final_box_heads) else 0
+#             cls_all.append(self.final_score_heads[head_idx](all_queries))
+#             box_all.append(self.final_box_heads[head_idx](all_queries).sigmoid())
+#         dec_scores, dec_boxes = torch.stack(cls_all), torch.stack(box_all)
+
+#         k = dn_meta["num_matching_queries"]
+#         if self.training:
+#             return dec_boxes, dec_scores, enc_boxes[:, :k], enc_scores[:, :k], dn_meta
+#         else:
+#             if dn_meta["num_denoising_queries"] > 0:
+#                 offset = dn_meta["num_denoising_queries"]
+#                 out = torch.cat([dec_boxes[-1][:, offset:], dec_scores[-1][:, offset:].sigmoid()], -1)
+#             else:
+#                 out = torch.cat([dec_boxes[-1], dec_scores[-1].sigmoid()], -1)
+#             dn_meta = None
+#             return out, (dec_boxes, dec_scores, enc_boxes, enc_scores, dn_meta)
+
+
+
+# class ViLBasedRTDETRHead(nn.Module):
+#     def __init__(
+#         self,
+#         ch_vil,
+#         vil_fpn_spatial_shapes,
+#         hidden_dim=256,            # match RT-DETR
+#         num_queries=300,
+#         num_vil_self_attn_layers=6, # match RT-DETR’s 6 layers
+#         vil_block_decoder_args=None,
+#         act=nn.SiLU,
+#         nc=80,
+#         num_denoising=100,          # match RT-DETR default
+#         label_noise_ratio=0.5,
+#         box_noise_scale=1.0,
+#         grid_size_anchor=0.05,
+#         return_intermediate_outputs=True,
+#         fuse_out_size=40,
+#     ):
+#         super().__init__()
+#         self.nc = int(nc)
+#         self.hidden_dim = int(hidden_dim)
+#         self.num_queries = int(num_queries)
+#         self.num_denoising = int(num_denoising)
+#         self.grid_size_anchor = grid_size_anchor
+#         self.fuse_out_size = fuse_out_size
+
+#         # --- Fusion from multi-scale PAFPN into one map ---
+#         total_in_channels = sum(ch_vil)
+#         self.fuse_to_single = nn.Conv2d(total_in_channels, self.hidden_dim, kernel_size=1, bias=True)
+
+#         # Single‐scale identity projection
+#         self.input_proj = nn.ModuleList([nn.Identity()])
+
+#         # Register unified spatial shape
+#         self.register_buffer(
+#             "vil_fpn_spatial_shapes",
+#             torch.tensor([[fuse_out_size, fuse_out_size]], dtype=torch.long),
+#             persistent=False
+#         )
+
+#         # Proposal heads (encoder‐style)
+#         self.proposal_feature_transform = nn.Sequential(
+#             nn.Linear(self.hidden_dim, self.hidden_dim),
+#             nn.LayerNorm(self.hidden_dim)
+#         )
+#         self.proposal_score_head = nn.Linear(self.hidden_dim, self.nc)
+#         self.proposal_box_head   = MLP(self.hidden_dim, self.hidden_dim, 4, 3, act=nn.SiLU)
+
+#         # ViL‐based self‐attn (“writer”) blocks
+#         base_cfg = dict(
+#             dim=self.hidden_dim,
+#             expansion=2,
+#             qkv_block_size=max(1, self.hidden_dim // 64),
+#             proj_bias=True,
+#             norm_bias=True,
+#             num_blocks=1,
+#             gate_soft_cap=15.0,
+#             chunk_size=64,
+#         )
+#         if vil_block_decoder_args is not None:
+#             base_cfg.update(vil_block_decoder_args)
+#         if self.hidden_dim % base_cfg["qkv_block_size"]:
+#             base_cfg["qkv_block_size"] = next(
+#                 (d for d in (16, 32, 64, 128, 256) if self.hidden_dim % d == 0), 1
+#             )
+
+#         self.writer = nn.ModuleList([
+#             ViLLayerFusedQKV(
+#                 **base_cfg,
+#                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
+#             )
+#             for i in range(num_vil_self_attn_layers)
+#         ])
+
+#         # ViL‐based cross‐attn (“reader”) blocks with four traversal directions
+#         directions = [
+#             (SequenceTraversal.ROWWISE_FROM_TOP_LEFT,  SequenceTraversal.ROWWISE_FROM_TOP_LEFT),
+#             (SequenceTraversal.ROWWISE_FROM_TOP_LEFT,  SequenceTraversal.ROWWISE_FROM_BOT_RIGHT),
+#             (SequenceTraversal.ROWWISE_FROM_BOT_RIGHT, SequenceTraversal.ROWWISE_FROM_TOP_LEFT),
+#             (SequenceTraversal.ROWWISE_FROM_BOT_RIGHT, SequenceTraversal.ROWWISE_FROM_BOT_RIGHT),
+#         ]
+#         self.reader = nn.ModuleList([
+#             RefactoredxLSTMCrossReader(
+#                 dim=self.hidden_dim,
+#                 expansion=base_cfg["expansion"],
+#                 qkv_block_size=base_cfg["qkv_block_size"],
+#                 chunk_size=base_cfg["chunk_size"],
+#                 gate_soft_cap=base_cfg["gate_soft_cap"],
+#                 seqlens=[fuse_out_size, fuse_out_size],
+#                 memory_direction=mem_dir,
+#                 query_direction=q_dir,
+#             )
+#             for i, (mem_dir, q_dir) in enumerate(directions[:num_vil_self_attn_layers])
+#         ])
+
+#         # One (score, box) head per layer for intermediate supervision
+#         n_sets = num_vil_self_attn_layers
+#         self.final_score_heads = nn.ModuleList(
+#             nn.Linear(self.hidden_dim, self.nc) for _ in range(n_sets)
+#         )
+#         self.final_box_heads = nn.ModuleList(
+#             MLP(self.hidden_dim, self.hidden_dim, 4, 3, act=nn.SiLU) for _ in range(n_sets)
+#         )
+
+#         # Denoising
+#         self.denoising_class_embed = nn.Embedding(self.nc, self.hidden_dim) if self.num_denoising else None
+#         self.label_noise_ratio, self.box_noise_scale = label_noise_ratio, box_noise_scale
+
+#         # Positional encoding for queries
+#         self.query_pos_head = MLP(4, 2 * self.hidden_dim, self.hidden_dim, 2, act=nn.SiLU)
+        
+
+
+#         self._reset_parameters()
+
+#     def _reset_parameters(self):
+#         # Bias init
+#         bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
+
+#         # Xavier‐uniform for all Linear and Conv layers
+#         for m in self.modules():
+#             if isinstance(m, nn.Linear) and m.weight.requires_grad:
+#                 nn.init.xavier_uniform_(m.weight)
+#             if isinstance(m, nn.Conv2d):
+#                 nn.init.xavier_uniform_(m.weight)
+#                 if m.bias is not None:
+#                     constant_(m.bias, 0.0)
+
+#         # Heads
+#         for h in self.final_score_heads:
+#             constant_(h.bias, bias_cls)
+#         for m in self.final_box_heads:
+#             constant_(m.layers[-1].weight, 0.0)
+#             constant_(m.layers[-1].bias,   0.0)
+
+#         # Proposal heads & query-pos head (already covered by modules loop,
+#         # but ensure biases zeroed)
+#         for m in self.proposal_feature_transform:
+#             if isinstance(m, nn.Linear):
+#                 constant_(m.bias, 0.0)
+#         for layer in self.query_pos_head.layers:
+#             if isinstance(layer, nn.Linear):
+#                 constant_(layer.bias, 0.0)
+
+#     @staticmethod
+#     def _meshgrid(H, W, dtype, device):
+#         y = torch.arange(H, dtype=dtype, device=device)
+#         x = torch.arange(W, dtype=dtype, device=device)
+#         return torch.meshgrid(y, x, indexing="ij")
+
+#     def _anchors(self, dtype, device, eps=1e-2):
+#         # Logit‐space anchors + mask (optional)
+#         shapes = self.vil_fpn_spatial_shapes.to(device)
+#         boxes = []
+#         for i, (H, W) in enumerate(shapes):
+#             gy, gx = self._meshgrid(H, W, dtype, device)
+#             grid = torch.stack([gx, gy], -1).float()
+#             grid = (grid + 0.5) / torch.tensor([W, H], dtype=dtype, device=device)
+#             wh = torch.full_like(grid, self.grid_size_anchor * (2.0**i))
+#             box = torch.cat([grid, wh], -1).view(-1, 4)  # normalized [0,1]
+#             boxes.append(box)
+#         anchors = torch.cat(boxes, dim=0).unsqueeze(0)        # (1, N, 4)
+#         anchors = torch.clamp(anchors, eps, 1 - eps)
+#         return torch.log(anchors / (1 - anchors))            # (1, N, 4) logits
+
+#     def _initial_queries(self, feats, batch):
+#         # feats: single fused map → [B, hidden_dim, S, S]
+#         proj = self.input_proj[0]
+#         f = feats[0]
+#         seq = proj(f.permute(0,2,3,1).reshape(f.size(0), -1, f.size(1)))
+#         bs, ntok, _ = seq.shape
+
+#         anchors = self._anchors(seq.dtype, seq.device).repeat(bs, 1, 1)
+#         dense = self.proposal_feature_transform(seq)
+#         score = self.proposal_score_head(dense)
+#         delta = self.proposal_box_head(dense)
+
+#         ref_cxcy, ref_wh = anchors[..., :2], anchors[..., 2:]
+#         boxes = torch.cat([
+#             ref_cxcy + delta[..., :2] * ref_wh,
+#             ref_wh * torch.exp(delta[..., 2:])
+#         ], -1).sigmoid()
+
+#         k = max(1, min(self.num_queries, ntok))
+#         topk = score.sigmoid().amax(-1).topk(k, dim=1).indices
+#         gather = lambda t, d: torch.gather(t, 1, topk.unsqueeze(-1).expand(-1, -1, d))
+
+#         sel_feat, sel_box, sel_score = (
+#             gather(seq, self.hidden_dim),
+#             gather(boxes, 4),
+#             gather(score, self.nc),
+#         )
+
+#         # --- Denoising (no try/except) ---
+#         dn_meta = dict(
+#             num_denoising_queries=0,
+#             num_matching_queries=k,
+#             dn_num_split=[0, k],
+#             dn_pos_idx=[torch.zeros([0], dtype=torch.long, device=seq.device) for _ in range(bs)],
+#             dn_num_group=0,
+#         )
+#         dn_emb = dn_bbox = None
+#         if self.training and self.num_denoising:
+#             dn_emb, dn_bbox, _, extra = get_cdn_group(
+#                 batch, self.nc, k,
+#                 self.denoising_class_embed.weight,
+#                 self.num_denoising,
+#                 self.label_noise_ratio,
+#                 self.box_noise_scale,
+#                 True
+#             )
+#             dn_meta.update(extra)
+#             dn_meta["num_denoising_queries"] = dn_emb.size(1)
+#             dn_meta["dn_num_split"] = [dn_emb.size(1), k]
+
+#         # Detach training queries
+#         q_feat = torch.cat([dn_emb, sel_feat], 1) if dn_emb is not None else sel_feat
+#         q_box  = torch.cat([dn_bbox, sel_box], 1) if dn_bbox is not None else sel_box
+#         if self.training:
+#             q_feat = q_feat.detach()
+#             q_box  = q_box.detach()
+
+#         return q_feat, q_box, sel_score, sel_box, dn_meta
+
+#     def forward(self, x, batch=None):
+#         # --- Fuse multi-scale PAFPN → single map ---
+#         resized = []
+#         for f in x:
+#             if f.shape[-1] > self.fuse_out_size:
+#                 resized.append(F.adaptive_avg_pool2d(f, (self.fuse_out_size,) * 2))
+#             elif f.shape[-1] < self.fuse_out_size:
+#                 resized.append(F.interpolate(f, size=(self.fuse_out_size,) * 2, mode='nearest'))
+#             else:
+#                 resized.append(f)
+#         fused = torch.cat(resized, dim=1)
+#         fused = self.fuse_to_single(fused)  # [B, hidden_dim, S, S]
+#         x_fused = [fused]
+
+#         # --- Queries & denoising setup ---
+#         qf, qb, enc_scores, enc_boxes, dn_meta = self._initial_queries(x_fused, batch if self.training else None)
+#         tgt_dtype = self.query_pos_head.layers[0].weight.dtype
+#         q = qf.to(tgt_dtype) + self.query_pos_head(qb.to(tgt_dtype))
+
+#         # Flatten memory
+#         memory = fused.permute(0,2,3,1).reshape(fused.size(0), -1, self.hidden_dim)
+
+#         dn_len = dn_meta["num_denoising_queries"]
+#         det_len = dn_meta["num_matching_queries"]
+#         dn_queries = q[:, :dn_len, :]
+#         det_queries = q[:, dn_len:, :]
+
+#         cls_all, box_all = [], []
+#         for i, writer in enumerate(self.writer):
+#             det_q_ = writer(det_queries)
+#             dn_q_  = writer(dn_queries) if dn_len > 0 else dn_queries
+#             all_q  = torch.cat([dn_q_, det_q_], dim=1) if dn_len > 0 else det_q_
+#             all_q  = self.reader[i](memory, all_q)
+
+#             if dn_len > 0:
+#                 dn_queries = all_q[:, :dn_len, :]
+#                 det_queries = all_q[:, dn_len:, :]
+#             else:
+#                 det_queries = all_q
+
+#             head_idx = i
+#             cls_all.append(self.final_score_heads[head_idx](all_q))
+#             box_all.append(self.final_box_heads[head_idx](all_q).sigmoid())
+
+#         dec_scores = torch.stack(cls_all)
+#         dec_boxes  = torch.stack(box_all)
+
+#         if self.training:
+#             return dec_boxes, dec_scores, enc_boxes[:, :det_len], enc_scores[:, :det_len], dn_meta
+
+#         # Inference: drop denoising
+#         if dn_len > 0:
+#             offset = dn_len
+#             out = torch.cat([
+#                 dec_boxes[-1][:, offset:],
+#                 dec_scores[-1][:, offset:].sigmoid()
+#             ], -1)
+#         else:
+#             out = torch.cat([dec_boxes[-1], dec_scores[-1].sigmoid()], -1)
+
+#         return (out, (dec_boxes, dec_scores, enc_boxes, enc_scores, None))
+
+class ViLBasedRTDETRHead(nn.Module):
     def __init__(
         self,
-        ch_vil,
-        vil_fpn_spatial_shapes,
-        hidden_dim=256,
-        num_queries=300,
-        num_vil_self_attn_layers=2,
-        vil_block_decoder_args=None,
-        act=nn.SiLU, 
+        ch_vil, # Channels from PAFPN for fusion
+        # vil_fpn_spatial_shapes, # This will be determined by fuse_out_size
+        hidden_dim=256,         # Matches RT-DETR 'hd'
+        num_queries=300,        # Matches RT-DETR 'nq'
+        num_vil_layers=6,       # Matches RT-DETR 'ndl' (formerly num_vil_self_attn_layers)
+        vil_block_decoder_args=None, # Keep for ViL blocks
+        act=nn.SiLU,            # Activation for MLPs (RT-DETR uses ReLU in its MLP by default, but can be changed)
+                                # Note: Your ViL blocks use SiLU internally. RT-DETR's deformable layers also often use SiLU/GeLU
         nc=80,
-        num_denoising=0,
+        # Denoising parameters (matching RT-DETR naming/defaults)
+        num_denoising=100,      # Matches RT-DETR 'nd'
         label_noise_ratio=0.5,
         box_noise_scale=1.0,
-        grid_size_anchor=0.05,
-        return_intermediate_outputs=False,
+        # Anchors
+        grid_size_anchor=0.05,  # Keep this, as it's for your single fused scale
+        # Query Embeddings
+        learnt_init_query=False, # Matches RT-DETR, make it an option
+        # MLP for query_pos_head (matching RT-DETR structure)
+        query_pos_head_num_layers=2,
+        # MLP for bbox heads (matching RT-DETR structure)
+        bbox_head_num_layers=3,
+        return_intermediate_outputs=True, # Usually True during training for DETRs
+        fuse_out_size=40,       # Example: Fused map size (e.g., S/32 if S=640)
     ):
         super().__init__()
-        self.nc, self.hidden_dim = int(nc), int(hidden_dim)
-        self.num_queries, self.num_denoising = int(num_queries), int(num_denoising)
+        self.nc = int(nc)
+        self.hidden_dim = int(hidden_dim)
+        self.num_queries = int(num_queries)
+        self.num_vil_layers = int(num_vil_layers) # num_decoder_layers
+        self.return_intermediate_outputs = return_intermediate_outputs
+
         self.grid_size_anchor = grid_size_anchor
+        self.fuse_out_size = fuse_out_size
 
-        self.input_proj = nn.ModuleList(
-            nn.Sequential(nn.Linear(c, hidden_dim), nn.LayerNorm(hidden_dim)) for c in ch_vil
+        # --- Feature Fusion (Your Specific Part) ---
+        # This part is unique to your HEAD 1 and is kept as per your request.
+        total_in_channels = sum(ch_vil)
+        self.fuse_to_single = nn.Conv2d(total_in_channels, self.hidden_dim, kernel_size=1)
+        # -------------------------------------------
+
+        # Input projection for multi-scale features is NOT used here,
+        # as we fuse first. self.input_proj = nn.ModuleList([nn.Identity()]) from your original code
+        # seems okay if ViL blocks expect a list, but if they expect a tensor, this might change.
+        # For _initial_queries, we will operate on the single fused map directly.
+        # So, self.input_proj isn't strictly needed in the RT-DETR sense.
+
+        # Spatial shapes for anchors: always the single fused shape
+        self.register_buffer(
+            "vil_fpn_spatial_shapes", # Name kept for consistency with your code
+            torch.tensor([[fuse_out_size, fuse_out_size]], dtype=torch.long),
+            persistent=False
         )
-        self.register_buffer("vil_fpn_spatial_shapes",
-                             torch.tensor(vil_fpn_spatial_shapes, dtype=torch.long),
-                             persistent=False)
 
-        self.proposal_feature_transform = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim)
+        # --- Encoder Head (for initial query selection from fused map) ---
+        # Mimicking RT-DETR's self.enc_output, self.enc_score_head, self.enc_bbox_head
+        self.enc_output = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim)
         )
-        self.proposal_score_head = nn.Linear(hidden_dim, nc)
-        self.proposal_box_head   = MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU)
+        self.enc_score_head = nn.Linear(hidden_dim, nc)
+        self.enc_bbox_head = MLP(hidden_dim, hidden_dim, 4, num_layers=bbox_head_num_layers, act=nn.SiLU) # Matched structure
 
-        base_cfg = dict(
-            dim=hidden_dim,
-            expansion=2,
-            qkv_block_size=max(1, hidden_dim // 64 if hidden_dim >= 64 else hidden_dim // 16),
-            proj_bias=True,
-            norm_bias=True,
-            num_blocks=1,
-            gate_soft_cap=15.0,
-            chunk_size=64,
+        # --- Denoising Part (Matching RT-DETR) ---
+        self.denoising_class_embed = nn.Embedding(nc, hidden_dim) if num_denoising > 0 else None
+        self.num_denoising = num_denoising
+        self.label_noise_ratio = label_noise_ratio
+        self.box_noise_scale = box_noise_scale
+
+        # --- Decoder/Query Embedding (Matching RT-DETR) ---
+        self.learnt_init_query = learnt_init_query
+        if learnt_init_query:
+            self.tgt_embed = nn.Embedding(num_queries, hidden_dim)
+        # Positional encoding from boxes
+        self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, num_layers=query_pos_head_num_layers, act=nn.SiLU) # Matched structure
+
+
+        # --- ViL Blocks (Your Specific Part - "Writer" and "Reader") ---
+        # This part is unique to your HEAD 1 and is kept.
+        # Assuming base_cfg and directions are defined correctly for your ViL blocks
+        base_cfg = dict( # Example, adjust as needed
+            dim=hidden_dim, expansion=2, qkv_block_size=max(1,hidden_dim // 64),
+            # ... other ViL specific params
         )
         if vil_block_decoder_args is not None:
-            base_cfg.update(vil_block_decoder_args)
-        if hidden_dim % base_cfg["qkv_block_size"]:
-            base_cfg["qkv_block_size"] = next(
-                (d for d in (16, 32, 64, 128, 256) if hidden_dim % d == 0), 1
-            )
+             base_cfg.update(vil_block_decoder_args)
 
         self.writer = nn.ModuleList(
             ViLLayerFusedQKV(
-                **base_cfg,
-                direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
-            ) for i in range(num_vil_self_attn_layers)
+                 **base_cfg,
+                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
+            ) for i in range(self.num_vil_layers)
         )
+        vil_directions = [ # Example, adjust as needed for RefactoredxLSTMCrossReader
+            (SequenceTraversal.ROWWISE_FROM_TOP_LEFT, SequenceTraversal.ROWWISE_FROM_TOP_LEFT),
+            (SequenceTraversal.ROWWISE_FROM_TOP_LEFT, SequenceTraversal.ROWWISE_FROM_BOT_RIGHT),
+        ] * ( (self.num_vil_layers + 1) // 2)
+
         self.reader = nn.ModuleList(
             RefactoredxLSTMCrossReader(
-                dim=hidden_dim,
-                expansion=base_cfg["expansion"],
-                qkv_block_size=base_cfg["qkv_block_size"],
-                chunk_size=base_cfg["chunk_size"],
-                gate_soft_cap=base_cfg["gate_soft_cap"],
-                direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT if i % 2 == 0 else SequenceTraversal.ROWWISE_FROM_BOT_RIGHT
-            ) for i in range(num_vil_self_attn_layers)
+                dim=hidden_dim, seqlens=[fuse_out_size, fuse_out_size], # Pass fused size
+                # ... other RefactoredxLSTMCrossReader specific params from base_cfg ...
+                expansion=base_cfg["expansion"], qkv_block_size=base_cfg["qkv_block_size"],
+                memory_direction=mem_dir, query_direction=q_dir,
+            ) for i, (mem_dir, q_dir) in enumerate(vil_directions[:self.num_vil_layers])
+        )
+        # -------------------------------------------------------------
+
+        # --- Final Prediction Heads (Matching RT-DETR structure) ---
+        # Renamed from final_score_heads / final_box_heads
+        # One set of heads per ViL layer output if return_intermediate_outputs
+        num_pred_heads = self.num_vil_layers if self.return_intermediate_outputs else 1
+
+        self.dec_score_head = nn.ModuleList(
+            [nn.Linear(hidden_dim, nc) for _ in range(num_pred_heads)]
+        )
+        self.dec_bbox_head = nn.ModuleList(
+            [MLP(hidden_dim, hidden_dim, 4, num_layers=bbox_head_num_layers, act=nn.SiLU) for _ in range(num_pred_heads)]
         )
 
-        n_sets = max(1, num_vil_self_attn_layers) if return_intermediate_outputs else 1
-        self.final_score_heads = nn.ModuleList(nn.Linear(hidden_dim, nc) for _ in range(n_sets))
-        self.final_box_heads = nn.ModuleList(
-            MLP(hidden_dim, hidden_dim, 4, 3, act=nn.SiLU) for _ in range(n_sets)
-        )
-        self.denoising_class_embed = nn.Embedding(nc, hidden_dim) if self.num_denoising else None
-        self.label_noise_ratio, self.box_noise_scale = label_noise_ratio, box_noise_scale
-        self.query_pos_head = MLP(4, 2 * hidden_dim, hidden_dim, 2, act=nn.SiLU)
         self._reset_parameters()
 
     def _reset_parameters(self):
-        bias_cls = bias_init_with_prob(0.01) / 80 * self.nc
-        for m in self.modules():
-            if isinstance(m, nn.Linear) and m.weight.requires_grad:
-                nn.init.xavier_uniform_(m.weight)
-        for h in self.final_score_heads:
-            constant_(h.bias, bias_cls)
-        for m in self.final_box_heads:
-            constant_(m.layers[-1].weight, 0.0)
-            constant_(m.layers[-1].bias,   0.0)
+        # Adopt RT-DETR's initialization for matching components
+        bias_cls = bias_init_with_prob(0.01) # RT-DETR uses 0.01
+        # if self.nc != 80: # Ultralytics RT-DETR adjusts this if nc is not 80.
+        #    bias_cls = bias_cls / 80 * self.nc # Optional adjustment
 
-    @staticmethod
-    def _meshgrid(H, W, dtype, device):
-        y, x = torch.arange(H, dtype=dtype, device=device), torch.arange(W, dtype=dtype, device=device)
-        gy, gx = torch.meshgrid(y, x, indexing="ij")
-        return gx, gy
+        # Encoder head
+        if hasattr(self.enc_output[0], 'weight'): # Linear layer
+            xavier_uniform_(self.enc_output[0].weight)
+        # constant_(self.enc_score_head.bias, bias_cls) # Done in loop below for all score heads
+        if hasattr(self.enc_bbox_head.layers[-1], 'weight'): # Last layer of MLP
+            constant_(self.enc_bbox_head.layers[-1].weight, 0.0)
+            constant_(self.enc_bbox_head.layers[-1].bias, 0.0)
 
-    def _anchors(self, dtype, device):
-        shapes = self.vil_fpn_spatial_shapes.to(device)
-        out = []
-        for i, (H, W) in enumerate(shapes):
-            gx, gy = self._meshgrid(int(H), int(W), dtype, device)
-            cxcy = (torch.stack([gx, gy], -1).float() + 0.5) / torch.tensor([W, H], dtype=dtype, device=device)
-            wh   = torch.full_like(cxcy, self.grid_size_anchor * (2.0 ** i))
-            out.append(torch.cat([cxcy, wh], -1).view(-1, 4))
-        return torch.cat(out).unsqueeze(0)
+        # Decoder/Query Embeddings
+        if self.learnt_init_query:
+            xavier_uniform_(self.tgt_embed.weight)
+        if hasattr(self.query_pos_head.layers[0], 'weight'): # First layer of MLP
+            xavier_uniform_(self.query_pos_head.layers[0].weight)
+        if len(self.query_pos_head.layers) > 1 and hasattr(self.query_pos_head.layers[1], 'weight'): # Second layer
+             xavier_uniform_(self.query_pos_head.layers[1].weight)
 
-    def _initial_queries(self, feats, batch):
-        seqs = [
-            proj_layer(f.permute(0, 2, 3, 1).reshape(f.size(0), -1, f.size(1)))
-            for f, proj_layer in zip(feats, self.input_proj)
-        ]
-        cat = torch.cat(seqs, 1)
-        bs, ntok, _ = cat.shape
-        anchors = self._anchors(cat.dtype, cat.device).repeat(bs, 1, 1)
 
-        dense = self.proposal_feature_transform(cat)
-        score = self.proposal_score_head(dense)
-        delta = self.proposal_box_head(dense)
+        # Final prediction heads (dec_score_head, dec_bbox_head)
+        for cls_, reg_ in zip(self.dec_score_head, self.dec_bbox_head):
+            constant_(cls_.bias, bias_cls)
+            if hasattr(reg_.layers[-1], 'weight'): # Last layer of MLP
+                constant_(reg_.layers[-1].weight, 0.0)
+                constant_(reg_.layers[-1].bias, 0.0)
+        
+        # Also initialize enc_score_head bias (if not covered by dec_score_head loop, e.g. if not return_intermediate)
+        constant_(self.enc_score_head.bias, bias_cls)
 
-        ref_cxcy, ref_wh = anchors[..., :2], anchors[..., 2:]
-        boxes = torch.cat([ref_cxcy + delta[..., :2] * ref_wh,
-                           ref_wh * torch.exp(delta[..., 2:])], -1).sigmoid()
 
-        k = max(1, min(self.num_queries, ntok))
-        topk = score.sigmoid().amax(-1).topk(k, 1).indices
-        gather = lambda t, d: torch.gather(t, 1, topk.unsqueeze(-1).expand(-1, -1, d))
-        sel_feat, sel_box, sel_score = gather(cat, self.hidden_dim), gather(boxes, 4), gather(score, self.nc)
+        # Initialize other ViL-specific layers (example, adjust as needed)
+        # Your original code initializes all nn.Linear with xavier_uniform_.
+        # This might be okay for the ViL blocks if they don't have specific needs.
+        # Or, ViLLayerFusedQKV and RefactoredxLSTMCrossReader should have their own reset_parameters method.
+        for m in self.writer.modules():
+            if hasattr(m, 'reset_parameters') and m != self: m.reset_parameters()
+        for m in self.reader.modules():
+            if hasattr(m, 'reset_parameters') and m != self: m.reset_parameters()
+        if hasattr(self.fuse_to_single, 'weight'):
+             xavier_uniform_(self.fuse_to_single.weight)
+             if self.fuse_to_single.bias is not None:
+                 constant_(self.fuse_to_single.bias, 0.0)
 
-        dn_meta = dict(
-            num_denoising_queries=0,
-            num_matching_queries=k,
-            dn_num_split=[0, k],
-            dn_pos_idx=[torch.zeros([0], dtype=torch.long, device=cat.device) for _ in range(bs)],
-            dn_num_group=0
-        )
 
-        dn_emb = dn_bbox = None
-        if self.training and self.num_denoising:
-            try:
-                dn_emb, dn_bbox, _, extra = get_cdn_group(
-                    batch, self.nc, k, self.denoising_class_embed.weight,
-                    self.num_denoising, self.label_noise_ratio, self.box_noise_scale, True
+    def _generate_anchors(self, B, dtype, device, eps=1e-2): # Matched signature from RT-DETR
+        # Generates anchors for the single fused scale, but applies logit transformation
+        # Matching RT-DETR's _generate_anchors structure, adapted for single scale
+        shapes = self.vil_fpn_spatial_shapes.to(device) # Should be [[fuse_out_size, fuse_out_size]]
+        anchors = []
+        # i will only be 0
+        for i, (H_fused, W_fused) in enumerate(shapes):
+            # Meshgrid (gx, gy)
+            sy = torch.arange(end=H_fused.item(), dtype=dtype, device=device)
+            sx = torch.arange(end=W_fused.item(), dtype=dtype, device=device)
+            # Consider torch.meshgrid indexing if needed for older PyTorch
+            grid_y, grid_x = torch.meshgrid(sy, sx, indexing="ij")
+            grid_xy = torch.stack([grid_x, grid_y], -1)  # [H_fused, W_fused, 2]
+
+            valid_WH = torch.tensor([W_fused, H_fused], dtype=dtype, device=device)
+            # Normalized cx, cy
+            grid_xy = (grid_xy.unsqueeze(0) + 0.5) / valid_WH # [1, H_fused, W_fused, 2]
+            # Anchor wh
+            # In RT-DETR: grid_size * (2.0**i). Here i is always 0 for the single fused scale.
+            wh = torch.ones_like(grid_xy) * self.grid_size_anchor # [1, H_fused, W_fused, 2]
+            
+            # Concatenate cxcywh and flatten
+            current_anchors = torch.cat([grid_xy, wh], -1).view(1, -1, 4) # [1, H_fused*W_fused, 4]
+            anchors.append(current_anchors)
+        
+        anchors = torch.cat(anchors, 1) # [1, num_total_anchors, 4] (num_total_anchors = H_fused*W_fused)
+
+        # Apply valid_mask and logit transformation like in RT-DETR
+        valid_mask = ((anchors > eps) & (anchors < 1 - eps)).all(-1, keepdim=True)
+        anchors = torch.log(anchors / (1 - anchors)) # To logit space
+        anchors = anchors.masked_fill(~valid_mask, float("inf"))
+        
+        return anchors.repeat(B, 1, 1), valid_mask.repeat(B, 1, 1) # Repeat for batch
+
+    def _initial_queries(self, fused_map, batch): # Fused map is [B, hidden_dim, H_fused, W_fused]
+            B, C, H_fused, W_fused = fused_map.shape
+            
+            # Flatten: [B, H_fused*W_fused, hidden_dim]
+            flattened_features = fused_map.flatten(2).permute(0, 2, 1)
+
+            # Generate anchors (now in logit space)
+            anchors_logit, valid_mask = self._generate_anchors(B, flattened_features.dtype, flattened_features.device)
+            
+            # Apply encoder heads to flattened features
+            transformed_features = self.enc_output(valid_mask * flattened_features)
+
+            scores_logits = self.enc_score_head(transformed_features)
+            boxes_delta_logit = self.enc_bbox_head(transformed_features)
+            
+            initial_boxes_logit = boxes_delta_logit + anchors_logit
+            initial_boxes_sigmoid = initial_boxes_logit.sigmoid()
+
+            ntok = flattened_features.shape[1]
+            actual_k = min(self.num_queries, ntok)
+            
+            topk_scores, topk_indices = torch.topk(scores_logits.max(-1).values, actual_k, dim=1)
+
+            expanded_topk_indices_feat = topk_indices.unsqueeze(-1).expand(-1, -1, self.hidden_dim)
+            sel_feat_content = torch.gather(transformed_features, 1, expanded_topk_indices_feat)
+            
+            expanded_topk_indices_box = topk_indices.unsqueeze(-1).expand(-1, -1, 4)
+            sel_box_sigmoid = torch.gather(initial_boxes_sigmoid, 1, expanded_topk_indices_box)
+            sel_box_logit = torch.gather(initial_boxes_logit, 1, expanded_topk_indices_box)
+
+            expanded_topk_indices_score = topk_indices.unsqueeze(-1).expand(-1, -1, self.nc)
+            sel_score_logits = torch.gather(scores_logits, 1, expanded_topk_indices_score)
+
+            # --- Denoising ---
+            dn_embed_content, dn_bbox_logit, attn_mask, dn_meta = get_cdn_group(
+                batch, self.nc, actual_k,
+                self.denoising_class_embed.weight if self.denoising_class_embed else None,
+                self.num_denoising, self.label_noise_ratio, self.box_noise_scale, self.training
+            )
+
+            # Prepare query features and reference boxes for ViL decoder
+            if self.learnt_init_query:
+                query_content_features_base = self.tgt_embed.weight.unsqueeze(0).repeat(B, 1, 1)
+            else:
+                query_content_features_base = sel_feat_content
+
+            reference_boxes_logit_base = sel_box_logit
+
+            # IMPORTANT: Detach if in training mode, and not learned queries
+            if self.training:
+                if not self.learnt_init_query: # Only detach if not learnt
+                    query_content_features_base = query_content_features_base.detach()
+                reference_boxes_logit_base = reference_boxes_logit_base.detach()
+                if dn_embed_content is not None: # Only detach if denoising is actually present
+                    dn_embed_content = dn_embed_content.detach()
+                if dn_bbox_logit is not None: # Only detach if denoising is actually present
+                    dn_bbox_logit = dn_bbox_logit.detach()
+
+
+            # Concatenate denoising queries for the decoder input
+            # Check if dn_embed_content and dn_bbox_logit are not None,
+            # which implies denoising is active and returned valid tensors.
+            if dn_embed_content is not None and dn_bbox_logit is not None:
+                q_content_for_decoder = torch.cat([dn_embed_content, query_content_features_base], dim=1)
+                q_box_logit_for_decoder = torch.cat([dn_bbox_logit, reference_boxes_logit_base], dim=1)
+            else:
+                q_content_for_decoder = query_content_features_base
+                q_box_logit_for_decoder = reference_boxes_logit_base
+                # If no denoising, ensure dn_meta is also correctly indicating no denoising
+                if dn_meta is not None: # dn_meta could be None if self.training is False
+                    dn_meta['num_denoising_queries'] = 0
+                    dn_meta['dn_num_split'][0] = 0
+                # If dn_meta is None (e.g., self.training is False), no need to set anything
+
+            # --- Fix for KeyError: 'num_denoising_queries' ---
+            # Get the actual number of denoising queries from dn_meta.
+            # Only access dn_meta if it's not None and we are in training.
+            current_num_denoising_queries = 0
+            if self.training and dn_meta is not None and 'num_denoising_queries' in dn_meta:
+                current_num_denoising_queries = dn_meta['num_denoising_queries']
+            # --- End Fix ---
+
+            if self.training and current_num_denoising_queries > 0:
+                # Create `enc_boxes_for_loss` that includes denoising part, converted to sigmoid
+                enc_boxes_for_loss = torch.cat([dn_bbox_logit.sigmoid(), sel_box_sigmoid], dim=1)
+
+                placeholder_dn_scores = torch.full(
+                    (B, current_num_denoising_queries, self.nc),
+                    0.0, # Placeholder value
+                    device=sel_score_logits.device,
+                    dtype=sel_score_logits.dtype
                 )
-                dn_meta.update(extra)
-                dn_meta["num_denoising_queries"] = dn_emb.size(1)
-                dn_meta["dn_num_split"] = [dn_emb.size(1), k]
-            except Exception as e:
-                warnings.warn(f"CDN disabled: {e}")
+                enc_scores_for_loss = torch.cat([placeholder_dn_scores, sel_score_logits], dim=1)
+            else:
+                enc_boxes_for_loss = sel_box_sigmoid
+                enc_scores_for_loss = sel_score_logits
 
-        q_feat = torch.cat([dn_emb, sel_feat], 1) if dn_emb is not None else sel_feat
-        q_box = torch.cat([dn_bbox, sel_box], 1) if dn_bbox is not None else sel_box
+            return q_content_for_decoder, q_box_logit_for_decoder, enc_boxes_for_loss, enc_scores_for_loss, dn_meta
 
-        if self.training:
-            q_feat = q_feat.detach()
-            q_box = q_box.detach()
 
-        return q_feat, q_box, sel_score, sel_box, dn_meta
-
-    def forward(self, x, batch=None):
-        # Prepare queries as before
-        qf, qb, enc_scores, enc_boxes, dn_meta = (*self._initial_queries(x, batch if self.training else None),)
-        tgt_dtype = self.query_pos_head.layers[0].weight.dtype
-        q = qf.to(tgt_dtype) + self.query_pos_head(qb.to(tgt_dtype))
-
-        # Prepare memory ONCE for all layers (project all FPN feature maps)
-        projected_feats = [
-            proj_layer(f.permute(0, 2, 3, 1).reshape(f.size(0), -1, f.size(1)))
-            for f, proj_layer in zip(x, self.input_proj)
+    def forward(self, x, batch=None): # x is list of PAFPN outputs
+        # --- FUSION: PAFPN multi-scale -> single [B, hidden_dim, H_fused, W_fused] map ---
+        # This is your specific part
+        resized = [
+            F.adaptive_avg_pool2d(f, (self.fuse_out_size, self.fuse_out_size)) if f.shape[-1] > self.fuse_out_size
+            else F.interpolate(f, size=(self.fuse_out_size, self.fuse_out_size), mode='nearest') if f.shape[-1] < self.fuse_out_size
+            else f
+            for f_idx, f in enumerate(x) # x is assumed to be a list of features from backbone
         ]
-        memory = torch.cat(projected_feats, 1)  # (B, N_mem, hidden_dim)
+        fused_cat = torch.cat(resized, dim=1)
+        fused_map = self.fuse_to_single(fused_cat) # [B, hidden_dim, H_fused, W_fused]
+        # -------------------------------------------
 
-        dn_len = dn_meta["num_denoising_queries"]
-        det_len = dn_meta["num_matching_queries"]
-        dn_queries = q[:, :dn_len, :]
-        det_queries = q[:, dn_len:, :]
+        # Initial queries from the fused map (encoder proposals)
+        # q_content, q_box_logit, enc_boxes_sigmoid, enc_scores_logits, dn_meta
+        q_content, qb_logit, enc_boxes, enc_scores, dn_meta = self._initial_queries(fused_map, batch)
+        
+        # Add positional embedding from boxes to content features
+        # qb_logit is [B, N_queries_total, 4]
+        # query_pos_head expects normalized boxes, but RT-DETR passes logit boxes and hopes MLP learns.
+        # Let's pass sigmoided boxes to query_pos_head if it expects normalized [0,1]
+        # Or, ensure query_pos_head can handle logit.
+        # Given RT-DETR structure, query_pos_head is applied to reference points (logit or sigmoid)
+        # If query_pos_head is like RT-DETR's, it expects 4D input.
+        # Let's assume it works fine on logit_boxes, or sigmoid(logit_boxes)
+        # Common practice is to use sigmoid(logit_boxes) for the positional embedding generation.
+        pos_embed = self.query_pos_head(qb_logit.sigmoid()) # Or qb_logit directly if MLP handles it
+        q_final_content = q_content + pos_embed # These are the queries for ViL blocks
 
-        cls_all, box_all = [], []
-        for i in range(len(self.writer)):
-            # ---- SELF-ATTENTION: process groups independently for perfect symmetry ----
-            det_queries_ = self.writer[i](det_queries)
-            if dn_len > 0:
-                dn_queries_ = self.writer[i](dn_queries)
+        # Memory for ViL blocks (from the single fused map)
+        memory = fused_map.permute(0,2,3,1).reshape(fused_map.size(0), -1, self.hidden_dim)
+
+        # --- ViL Decoder Iterations (Your Specific Part) ---
+        # dn_len and det_len from dn_meta
+        dn_len = dn_meta['num_denoising_queries'] if dn_meta and 'num_denoising_queries' in dn_meta else 0
+        # det_len = dn_meta['num_matching_queries'] if dn_meta else q_final_content.size(1) - dn_len
+        
+        # q_final_content is now [B, total_queries, C]
+        # Split into dn_queries and det_queries for ViL processing if ViL needs it
+        current_queries = q_final_content # This is `tgt` or `embed` in RT-DETR decoder
+
+        all_layer_outputs_scores_logits = []
+        all_layer_outputs_boxes_sigmoid = []
+
+        # Loop through ViL layers
+        for i in range(self.num_vil_layers):
+            # Queries might be modified by self-attention (writer)
+            # Then cross-attention with memory (reader)
+            # This logic needs to fit how your ViL writer/reader expect inputs
+            # Assuming writer (self-attn like) then reader (cross-attn like)
+            # Example flow:
+            # current_queries_self_attended = self.writer[i](current_queries) # If writer takes all queries
+            # current_queries_cross_attended = self.reader[i](memory, current_queries_self_attended)
+            # For simplicity, if your writer+reader form one "decoder layer":
+            
+            # Simplified: Assume writer does self-attention part, reader does cross-attention part
+            # Need to handle dn_queries and det_queries separately if ViL blocks require specific processing
+            # like some transformer decoders do (e.g. only cross-attend for detection queries).
+            # For now, treat all queries together for ViL blocks:
+            
+            temp_queries = self.writer[i](current_queries)
+            current_queries = self.reader[i](memory, temp_queries) # Output of ViL layer [B, N_queries_total, C]
+
+            # Get predictions from this layer's heads
+            # Head index for intermediate outputs
+            head_idx = i if self.return_intermediate_outputs else 0
+            
+            layer_scores_logits = self.dec_score_head[head_idx](current_queries) # [B, N_queries_total, nc]
+            
+            # Box prediction: RT-DETR adds deltas to reference points.
+            # Here, qb_logit are the reference points from the previous stage (or encoder).
+            # So, dec_bbox_head should predict deltas for these.
+            layer_boxes_delta_logit = self.dec_bbox_head[head_idx](current_queries) # [B, N_queries_total, 4]
+            layer_boxes_logit = qb_logit + layer_boxes_delta_logit # Add delta to reference boxes
+            layer_boxes_sigmoid = layer_boxes_logit.sigmoid()
+
+            all_layer_outputs_scores_logits.append(layer_scores_logits)
+            all_layer_outputs_boxes_sigmoid.append(layer_boxes_sigmoid)
+            
+            # Update qb_logit for the next layer if iterative refinement of boxes is desired as reference
+            if self.training: # Detach for next layer's reference if iterative refinement
+                qb_logit = layer_boxes_logit.detach()
             else:
-                dn_queries_ = dn_queries
+                qb_logit = layer_boxes_logit
+        
+        # Stack intermediate outputs (matching RT-DETR output format for decoder)
+        # [num_layers, B, N_queries_total, C]
+        dec_scores_logits = torch.stack(all_layer_outputs_scores_logits)
+        dec_boxes_sigmoid = torch.stack(all_layer_outputs_boxes_sigmoid)
 
-            # ---- CROSS-ATTENTION: process all together (memory is safe to share) ----
-            all_queries = torch.cat([dn_queries_, det_queries_], dim=1) if dn_len > 0 else det_queries_
-            all_queries = self.reader[i](memory, all_queries)
-
-            # ---- SPLIT for next layer ----
-            if dn_len > 0:
-                dn_queries = all_queries[:, :dn_len, :]
-                det_queries = all_queries[:, dn_len:, :]
-            else:
-                det_queries = all_queries
-
-            # ---- Collect head outputs for each layer ----
-            head_idx = i if i < len(self.final_box_heads) else 0
-            cls_all.append(self.final_score_heads[head_idx](all_queries))
-            box_all.append(self.final_box_heads[head_idx](all_queries).sigmoid())
-        dec_scores, dec_boxes = torch.stack(cls_all), torch.stack(box_all)
-
-        k = dn_meta["num_matching_queries"]
+        # Prepare final output (matching RT-DETR)
+        # enc_boxes and enc_scores are from the initial_queries stage
+        # dec_boxes_sigmoid and dec_scores_logits are from the ViL decoder stages
+        
+        # k_enc = enc_scores.size(1) # Number of proposals from encoder stage
+        # For loss calculation, enc_scores and enc_boxes are needed.
+        # RT-DETR might select top-k from enc_scores/enc_boxes for loss if different from num_decoder_queries
+        # Here, enc_scores/enc_boxes from _initial_queries are already top-k based on num_queries
+        
         if self.training:
-            return dec_boxes, dec_scores, enc_boxes[:, :k], enc_scores[:, :k], dn_meta
+            return dec_boxes_sigmoid, dec_scores_logits, enc_boxes, enc_scores, dn_meta
         else:
-            if dn_meta["num_denoising_queries"] > 0:
-                offset = dn_meta["num_denoising_queries"]
-                out = torch.cat([dec_boxes[-1][:, offset:], dec_scores[-1][:, offset:].sigmoid()], -1)
+            # Inference: use outputs from the last ViL layer
+            last_dec_boxes_sigmoid = dec_boxes_sigmoid[-1] # [B, N_queries_total, 4]
+            last_dec_scores_logits = dec_scores_logits[-1] # [B, N_queries_total, nc]
+
+            # Remove denoising queries for final output if they exist
+            if dn_meta and dn_meta.get('num_denoising_queries', 0) > 0:
+                dn_queries_count = dn_meta['num_denoising_queries']
+                # Output only detection queries
+                final_boxes = last_dec_boxes_sigmoid[:, dn_queries_count:, :]
+                final_scores = last_dec_scores_logits[:, dn_queries_count:, :].sigmoid() # Apply sigmoid for scores
             else:
-                out = torch.cat([dec_boxes[-1], dec_scores[-1].sigmoid()], -1)
-            dn_meta = None
-            return out, (dec_boxes, dec_scores, enc_boxes, enc_scores, dn_meta)
+                final_boxes = last_dec_boxes_sigmoid
+                final_scores = last_dec_scores_logits.sigmoid()
+
+            # Concatenate boxes and scores: [B, N_det_queries, 4+nc]
+            # This matches Ultralytics RT-DETR's inference output format
+            # Note: RT-DETR output for export might be squeezed if B=1
+            # y = torch.cat((dec_bboxes.squeeze(0), dec_scores.squeeze(0).sigmoid()), -1)
+            # Here, final_boxes/final_scores are already [B, N, Dim]
+            output = torch.cat([final_boxes, final_scores], dim=-1)
+            
+            # Original RT-DETR returns (y, (all_outputs_for_eval_if_needed))
+            # For simplicity, just return concatenated output, or adapt as needed.
+            all_outputs_tuple = (dec_boxes_sigmoid, dec_scores_logits, enc_boxes, enc_scores, dn_meta)
+            return output, all_outputs_tuple # Or just output

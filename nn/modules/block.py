@@ -1296,108 +1296,213 @@ class TorchVision(nn.Module):
 # 1) VisionLSTM - multi-output wrapper
 ################################################################################
 import einops
-
 class VisionLSTMTorch(nn.Module):
     """
-    A custom YOLO/Ultralytics block that loads 'VisionLSTM2' from the
-    torch.hub repo 'nx-ai/vision-lstm' and returns multiple outputs
-    at specified block indices as well as the final feature map.
+    A custom YOLO/Ultralytics block that loads 'VisionLSTM2' or specific pre-trained models
+    from the torch.hub repo 'nx-ai/vision-lstm' and returns multiple outputs at specified
+    block indices as well as the final feature map.
 
     Usage in a YOLO-style YAML:
-      - [-1, 1, VisionLSTM, [192, {
-          "depth": 12,
+      - [-1, 1, VisionLSTM, [3, 192, {
+          "model_name": "vil2-tiny",  # Optional: specify pre-trained model name
           "output_indices": [3, 7, 11],
           "mode": "features",
-          "pooling": "to_image",
-          ...
+          "pooling": "to_image"
       }]]
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__()
-        # Ultralytics parse_model typically provides (c1, dim, config) as *args
-        # e.g. args = [<input_channels>, <dim=192>, <dict_with_keys>]
+        # Handle Ultralytics YAML parsing
         if len(args) == 1 and isinstance(args[0], (list, tuple)):
             args = args[0]
-
         if len(args) < 2:
             raise ValueError("VisionLSTM requires at least (c1, dim) arguments.")
 
         # Extract c1, dim, config
-        self.c1 = args[0]    # input channels from the previous layer
-        self.dim = args[1]   # e.g. 192
+        self.c1 = args[0]    # Input channels
+        self.dim = args[1]   # Expected dimension
         self.config = args[2] if len(args) > 2 else {}
 
-        # Pop custom hyperparameters that Torch Hub's VisionLSTM2 doesn't expect
-        self.depth = self.config.pop("depth", 12)
+        # Extract model_name if specified
+        model_name = self.config.pop("model_name", None)
+
+        if model_name:
+            # Load specific pre-trained model (e.g., "vil2-tiny")
+            self.m = torch.hub.load("nx-ai/vision-lstm", model_name)
+            # Optional: Validate dim if model exposes it
+            if hasattr(self.m, "dim") and self.m.dim != self.dim:
+                raise ValueError(f"Specified dim {self.dim} does not match pre-trained model dim {self.m.dim}")
+        else:
+            # Load "VisionLSTM2" with specified parameters
+            self.depth = self.config.pop("depth", 12)
+            self.mode = self.config.pop("mode", "features")
+            pretrained = self.config.pop("pretrained", False)
+            self.m = torch.hub.load(
+                "nx-ai/vision-lstm",
+                "VisionLSTM2",
+                dim=self.dim,
+                depth=self.depth,
+                mode=self.mode,
+                pooling=None,  # Manual pooling in forward
+                pretrained=pretrained,
+                **self.config
+            )
+
+        # Pop custom hyperparameters
         self.output_indices = self.config.pop("output_indices", [])
-        self.mode = self.config.pop("mode", "features")
         self.pooling = self.config.pop("pooling", "to_image")
 
         # Validate output_indices vs. depth
         max_idx = max(self.output_indices) if self.output_indices else 0
-        if self.depth <= max_idx:
+        if hasattr(self, "depth") and self.depth <= max_idx:
             raise ValueError(
-                f"Config depth={self.depth} is too small for output_indices={self.output_indices}. "
-                "Increase depth or reduce output_indices."
+                f"Config depth={self.depth} is too small for output_indices={self.output_indices}."
             )
 
-        # Load VisionLSTM2 from torch.hub, overriding 'pooling' with None, if we plan to do custom pooling
-        self.m = torch.hub.load(
-            "nx-ai/vision-lstm",
-            "VisionLSTM2",
-            dim=self.dim,
-            depth=self.depth,
-            mode=self.mode,
-            pooling=None,  # we'll do manual pooling in forward
-            **self.config
-        )
+        # Debugging: Print available attributes of self.m
+        # Uncomment the line below to inspect the model structure
+        # print(dir(self.m))
 
     def forward(self, x):
-        """
-        Forward pass:
-          1) Patch + pos embed
-          2) Pass through each block in .blocks
-          3) Collect partial outputs at self.output_indices
-          4) Final norm & optional "to_image" reshape
-          5) Return a list of partial + final outputs
-        """
-        # 1) Patch embed & pos embed
+        # Patch embedding and positional embedding
         x = self.m.patch_embed(x)
         x = self.m.pos_embed(x)
-        x = einops.einops.rearrange(x, "b h w d -> b (h w) d")  # Flatten to (B, H*W, dim)
-
+        
+        # Flatten to sequence: [B, H, W, D] -> [B, S, D]
+        x = einops.rearrange(x, "b h w d -> b (h w) d")
+        
+        # Initialize list to store intermediate outputs
         partial_outputs = []
-
-        # 2) Pass through each block in self.m.blocks
+        
+        # Process through each block
         for i, block in enumerate(self.m.blocks):
             x = block(x)
+            # Extract intermediate output if block index is in output_indices
             if i in self.output_indices:
                 seqlen_h, seqlen_w = self.m.patch_embed.seqlens
-                # IMPORTANT: use (h w) on left side to match h,w on right
-                out = einops.einops.rearrange(
+                out = einops.rearrange(
                     x, "b (h w) d -> b d h w",
                     h=seqlen_h, w=seqlen_w
                 )
-                out = self.m.norm(out)
                 partial_outputs.append(out)
-
-        # 3) Final normalization
+        
+        # Apply final normalization
         x = self.m.norm(x)
-
-        # 4) Manual pooling if "to_image"
+        
+        # Handle pooling for the final output
         if self.pooling == "to_image":
-            if hasattr(self.m, "legacy_norm"):
-                x = self.m.legacy_norm(x)
             seqlen_h, seqlen_w = self.m.patch_embed.seqlens
-            x = einops.einops.rearrange(
+            x = einops.rearrange(
                 x, "b (h w) d -> b d h w",
                 h=seqlen_h, w=seqlen_w
             )
-
-        # 5) Append final output
+        # Add final output to the list
         partial_outputs.append(x)
+        
         return partial_outputs
+
+# class VisionLSTMTorch(nn.Module):
+#     """
+#     A custom YOLO/Ultralytics block that loads 'VisionLSTM2' from the
+#     torch.hub repo 'nx-ai/vision-lstm' and returns multiple outputs
+#     at specified block indices as well as the final feature map.
+
+#     Usage in a YOLO-style YAML:
+#       - [-1, 1, VisionLSTM, [192, {
+#           "depth": 12,
+#           "output_indices": [3, 7, 11],
+#           "mode": "features",
+#           "pooling": "to_image",
+#           ...
+#       }]]
+#     """
+
+#     def __init__(self, *args, **kwargs):
+#         super().__init__()
+#         # Ultralytics parse_model typically provides (c1, dim, config) as *args
+#         # e.g. args = [<input_channels>, <dim=192>, <dict_with_keys>]
+#         if len(args) == 1 and isinstance(args[0], (list, tuple)):
+#             args = args[0]
+
+#         if len(args) < 2:
+#             raise ValueError("VisionLSTM requires at least (c1, dim) arguments.")
+
+#         # Extract c1, dim, config
+#         self.c1 = args[0]    # input channels from the previous layer
+#         self.dim = args[1]   # e.g. 192
+#         self.config = args[2] if len(args) > 2 else {}
+
+#         # Pop custom hyperparameters that Torch Hub's VisionLSTM2 doesn't expect
+#         self.depth = self.config.pop("depth", 12)
+#         self.output_indices = self.config.pop("output_indices", [])
+#         self.mode = self.config.pop("mode", "features")
+#         self.pooling = self.config.pop("pooling", "to_image")
+
+#         # Validate output_indices vs. depth
+#         max_idx = max(self.output_indices) if self.output_indices else 0
+#         if self.depth <= max_idx:
+#             raise ValueError(
+#                 f"Config depth={self.depth} is too small for output_indices={self.output_indices}. "
+#                 "Increase depth or reduce output_indices."
+#             )
+
+#         # Load VisionLSTM2 from torch.hub, overriding 'pooling' with None, if we plan to do custom pooling
+#         self.m = torch.hub.load(
+#             "nx-ai/vision-lstm",
+#             "VisionLSTM2",
+#             dim=self.dim,
+#             depth=self.depth,
+#             mode=self.mode,
+#             pooling=None,  # we'll do manual pooling in forward
+#             **self.config
+#         )
+
+#     def forward(self, x):
+#         """
+#         Forward pass:
+#           1) Patch + pos embed
+#           2) Pass through each block in .blocks
+#           3) Collect partial outputs at self.output_indices
+#           4) Final norm & optional "to_image" reshape
+#           5) Return a list of partial + final outputs
+#         """
+#         # 1) Patch embed & pos embed
+#         x = self.m.patch_embed(x)
+#         x = self.m.pos_embed(x)
+#         x = einops.einops.rearrange(x, "b h w d -> b (h w) d")  # Flatten to (B, H*W, dim)
+
+#         partial_outputs = []
+
+#         # 2) Pass through each block in self.m.blocks
+#         for i, block in enumerate(self.m.blocks):
+#             x = block(x)
+#             if i in self.output_indices:
+#                 seqlen_h, seqlen_w = self.m.patch_embed.seqlens
+#                 # IMPORTANT: use (h w) on left side to match h,w on right
+#                 out = einops.einops.rearrange(
+#                     x, "b (h w) d -> b d h w",
+#                     h=seqlen_h, w=seqlen_w
+#                 )
+#                 out = self.m.norm(out)
+#                 partial_outputs.append(out)
+
+#         # 3) Final normalization
+#         x = self.m.norm(x)
+
+#         # 4) Manual pooling if "to_image"
+#         if self.pooling == "to_image":
+#             if hasattr(self.m, "legacy_norm"):
+#                 x = self.m.legacy_norm(x)
+#             seqlen_h, seqlen_w = self.m.patch_embed.seqlens
+#             x = einops.einops.rearrange(
+#                 x, "b (h w) d -> b d h w",
+#                 h=seqlen_h, w=seqlen_w
+#             )
+
+#         # 5) Append final output
+#         partial_outputs.append(x)
+#         return partial_outputs
 
 
 
