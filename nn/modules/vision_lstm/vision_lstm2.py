@@ -620,7 +620,7 @@ class RefactoredxLSTMCrossReader(nn.Module):
             dim=inner_dim,
             num_heads=num_heads,
             norm_bias=norm_bias,
-            eps=1e-5,
+            eps=1e-3,
             chunk_size=chunk_size,
             gate_soft_cap=gate_soft_cap,
         )
@@ -907,7 +907,7 @@ class MatrixLSTMCell(nn.Module):
         # Fused ifgate projection
         self.ifgate = nn.Linear(3 * dim, 2 * num_heads)
 
-        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=1e-6)
+        self.outnorm = MultiHeadLayerNorm(ndim=dim, weight=True, bias=norm_bias, eps=eps)
         self.causal_mask_cache = {}
         self.chunk_size = chunk_size
 
