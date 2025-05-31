@@ -1,0 +1,1 @@
+96 dims ran with this config to great succes. Running into issues at 192
