@@ -94,6 +94,7 @@ def get_sincos_pos_embed_from_grid(grid, dim: int, max_wavelength: int = 10000):
 
 
 # SequenceConv2d (unchanged from original)
+@torch.compile
 class SequenceConv2d(nn.Module):
     """
     A 2D convolution layer applied to a sequence representing a flattened 2D grid.
@@ -123,6 +124,88 @@ class SequenceConv2d(nn.Module):
         return x.reshape(B, C, S).permute(0, 2, 1)  # (B, S, C)
 
 
+# ------------------------------------------------------------
+# 1) Extend SequenceConv2d to handle MULTI‐SCALE
+# ------------------------------------------------------------
+@torch.compile
+class MultiScaleSequenceConv2d(nn.Module):
+    """
+    A wrapper that applies a separate depthwise 2D convolution to each scale in a multi‐scale feature map.
+    Input (x) is assumed to be a single (B, S_total, C) tensor where
+       S_total = sum_i (H_i * W_i)
+    and `multi_seqlens = [(H1,W1), (H2,W2), ...]` describes how to split S_total
+    into multiple (Hi × Wi) grids. We then:
+      - split x into pieces along the sequence dimension: x_i of shape (B, S_i, C)
+      - reshape x_i → (B, C, H_i, W_i), conv2d → (B, C, H_i, W_i)
+      - flatten → (B, S_i, C) and concatenate back to (B, S_total, C).
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size, padding, groups, bias, multi_seqlens):
+        """
+        Args:
+            in_channels  (int): same as nn.Conv2d in_channels
+            out_channels (int): same as nn.Conv2d out_channels
+            kernel_size  (int or tuple)
+            padding      (int or tuple)
+            groups       (int): typically set to `in_channels` if you want a depthwise conv per channel
+            bias         (bool)
+            multi_seqlens (list of 2‐tuples): e.g. [(H1,W1), (H2,W2), ...]
+        """
+        super().__init__()
+        # Store the shapes of each scale:
+        self.multi_seqlens = list(multi_seqlens)
+        # Build ONE shared Conv2d layer (depthwise if groups=in_channels)
+        # We assume each scale has the same number of channels (=in_channels) and we want the same conv kernel on each.
+        self.conv = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            groups=groups,
+            bias=bias
+        )
+
+        # Precompute the flattened lengths for each scale:
+        self.flat_lengths = [h * w for (h, w) in self.multi_seqlens]
+        total_len = sum(self.flat_lengths)
+        self.total_length = total_len
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor of shape (B, S_total, C), where
+                 S_total == sum_i (H_i * W_i)
+        Returns:
+            y: Tensor of shape (B, S_total, C_out), after applying conv2d independently on each scale.
+        """
+        B, S_total, C = x.shape
+        if S_total != self.total_length:
+            raise ValueError(
+                f"Input sequence length {S_total} does not match the sum of declared multi_seqlens = {self.total_length}"
+            )
+
+        outputs = []
+        start = 0
+
+        # For each scale i: (H_i, W_i) with S_i = H_i*W_i
+        for idx, (H_i, W_i) in enumerate(self.multi_seqlens):
+            S_i = H_i * W_i
+            x_i = x[:, start : start + S_i, :]         # (B, S_i, C)
+            start += S_i
+
+            # Reshape to 2D grid: (B, C, H_i, W_i)
+            x_i_2d = x_i.permute(0, 2, 1).reshape(B, C, H_i, W_i)
+
+            # Apply the same conv to each scale grid:
+            y_i_2d = self.conv(x_i_2d)                 # (B, C_out, H_i, W_i)
+
+            # Flatten back to (B, S_i, C_out)
+            y_i = y_i_2d.reshape(B, C_out, S_i).permute(0, 2, 1)  # (B, S_i, C_out)
+            outputs.append(y_i)
+
+        # Concatenate along the sequence dimension:
+        y = torch.cat(outputs, dim=1)  # (B, S_total, C_out)
+        return y
 
 # New SequenceConv3d for 3D sequences
 class SequenceConv3d(nn.Conv3d):
@@ -148,6 +231,7 @@ class SequenceConv3d(nn.Conv3d):
 
 # VitPatchEmbed (unchanged from original, supports 3D)
 
+@torch.compile
 class VitPatchEmbed(nn.Module):
     def __init__(self, dim, num_channels, resolution, patch_size, stride=None, init_weights="xavier_uniform"):
         super().__init__()
@@ -229,6 +313,7 @@ class VitPatchEmbed(nn.Module):
 
 
 # General VitPosEmbed supporting arbitrary dimensions (from vit_pos_embed.py)
+@torch.compile
 class VitPosEmbed(nn.Module):
     def __init__(
             self,

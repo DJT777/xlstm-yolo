@@ -298,6 +298,7 @@ class ViLLayer(nn.Module):
 
         self.reset_parameters()
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.norm(x)
@@ -346,6 +347,173 @@ class ViLLayer(nn.Module):
 
     def reset_parameters(self):
         # Initialize weights as per original conventions
+        small_init_(self.proj_up.weight, self.dim)
+        if self.proj_up.bias is not None:
+            nn.init.zeros_(self.proj_up.bias)
+
+        small_init_(self.qk_proj.weight, self.dim)
+        if self.qk_proj.bias is not None:
+            nn.init.zeros_(self.qk_proj.bias)
+
+        small_init_(self.v_proj.weight, self.dim)
+        if self.v_proj.bias is not None:
+            nn.init.zeros_(self.v_proj.bias)
+
+        wang_init_(self.proj_down.weight, self.dim, num_blocks=self.num_blocks or 1)
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
+
+        nn.init.ones_(self.learnable_skip)
+        self.mlstm_cell.reset_parameters()
+        self.norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
+        self.ffn.reset_parameters()
+
+
+
+# ------------------------------------------------------------
+# 2) Modify ViLLayer to accept a list of seqlens instead of a single one
+# ------------------------------------------------------------
+@torch.compile
+class ViLLayerMultiScale(nn.Module):
+    def __init__(
+        self,
+        dim,
+        direction,
+        expansion=2,
+        qkv_block_size=4,
+        proj_bias=True,
+        norm_bias=True,
+        conv_bias=True,
+        conv_kernel_size=3,
+        conv_kind="2d",
+        init_weights="original-fixed",
+        seqlens=None,               # ← now expects a LIST-of-[Hi,Wi] pairs
+        num_blocks=15,
+        gate_soft_cap=15.0,
+        ffn_proj_factor=2.6667,
+        ffn_round_up_to_multiple_of=64,
+        weight_mode="fused",
+        chunk_size=64,
+    ):
+        super().__init__()
+        assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+        self.dim = dim
+        self.direction = direction
+        self.expansion = expansion
+        self.qkv_block_size = qkv_block_size
+        self.gate_soft_cap = gate_soft_cap
+        self.weight_mode = weight_mode
+        self.num_blocks = num_blocks
+
+        inner_dim = expansion * dim
+        num_heads = inner_dim // qkv_block_size
+        self.inner_dim = inner_dim
+        self.num_heads = num_heads
+
+        # Fused up-projection for Q, K, V
+        self.proj_up = nn.Linear(dim, 2 * inner_dim, bias=proj_bias)
+
+        # --- Replace the single‐scale SequenceConv2d with the multi‐scale version ---
+        if conv_kind == "causal1d":
+            raise NotImplementedError("This example focuses on 2d only")
+        elif conv_kind == "2d":
+            # seqlens is now a list of [Hi, Wi], e.g. [[H1,W1], [H2,W2], …]
+            # We'll pass that directly into our MultiScaleSequenceConv2d.
+            # Note: in_channels = inner_dim, out_channels = inner_dim, groups=inner_dim for depthwise
+            self.conv = MultiScaleSequenceConv2d(
+                in_channels=inner_dim,
+                out_channels=inner_dim,
+                kernel_size=conv_kernel_size,
+                padding=conv_kernel_size // 2,
+                groups=inner_dim,
+                bias=conv_bias,
+                multi_seqlens=seqlens,      # e.g. [[H1, W1], [H2, W2], ...]
+            )
+        else:
+            raise NotImplementedError(f"conv_kind '{conv_kind}' is not supported")
+
+        # Then project x_qk_conv_act → Q/K and x_v separately as before
+        self.qk_proj = nn.Linear(inner_dim, 2 * inner_dim, bias=proj_bias)
+        self.v_proj = nn.Linear(inner_dim, inner_dim, bias=proj_bias)
+
+        # The rest (MatrixLSTMCell, skip, proj_down, norms, FFN, etc.) is unchanged:
+        self.mlstm_cell = MatrixLSTMCell(
+            dim=inner_dim,
+            num_heads=num_heads,
+            norm_bias=norm_bias,
+            eps=1e-5,
+            chunk_size=chunk_size,
+            gate_soft_cap=gate_soft_cap,
+        )
+
+        self.learnable_skip = nn.Parameter(torch.ones(inner_dim))
+        self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
+
+        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn = FeedForward(
+            embedding_dim=dim,
+            ffn_proj_factor=ffn_proj_factor,
+            ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+            use_bias=proj_bias,
+            weight_mode=weight_mode,
+            num_blocks=num_blocks or 1,
+        )
+
+        self.reset_parameters()
+
+    @torch.compile
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: Tensor of shape (B, S_total, dim)
+        where S_total = sum_i (H_i * W_i) across all scales.
+        """
+        residual = x
+        x = self.norm(x)
+
+        # If we're traversing bottom-right→top-left, flip now:
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            x = x.flip(dims=[1])
+
+        # Up‐project to get Q/K/V
+        x_inner = self.proj_up(x)                  # (B, S_total, 2*inner_dim)
+        x_qk, x_v = torch.chunk(x_inner, 2, dim=-1)  # each is (B, S_total, inner_dim)
+
+        # **Convolution on x_qk** (now multi‐scale)
+        # This applies a separate depthwise 2D‐conv on each [Hi×Wi] slice inside x_qk:
+        x_qk_conv_act = F.silu(self.conv(x_qk))     # (B, S_total, inner_dim)
+
+        # Project to Q/K from the conv’d feature, and V from the “x_v” branch
+        qk = self.qk_proj(x_qk_conv_act)            # (B, S_total, 2*inner_dim)
+        q, k = torch.chunk(qk, 2, dim=-1)            # each (B, S_total, inner_dim)
+        v = self.v_proj(x_v)                        # (B, S_total, inner_dim)
+
+        # (You previously reshaped to multi‐head; we keep the same shape for mLSTMCell)
+        # Now pass through the MatrixLSTMCell
+        h_tilde_state = self.mlstm_cell(q=q, k=k, v=v)  # (B, S_total, inner_dim)
+        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * x_qk_conv_act)  # (B, S_total, inner_dim)
+
+        # Project back down to dim
+        x_mlstm = self.proj_down(h_tilde_state_skip)     # (B, S_total, dim)
+
+        # Flip back if needed
+        if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
+            x_mlstm = x_mlstm.flip(dims=[1])
+
+        # Residual
+        x = residual + x_mlstm
+
+        # FFN block
+        ffn_residual = x
+        x_ffn = self.ffn_norm(x)
+        x_ffn = self.ffn(x_ffn)
+        x = ffn_residual + x_ffn
+
+        return x
+
+    def reset_parameters(self):
+        # Initialize all Linear/Conv/LayerNorm/FFN layers exactly as before
         small_init_(self.proj_up.weight, self.dim)
         if self.proj_up.bias is not None:
             nn.init.zeros_(self.proj_up.bias)
@@ -425,6 +593,7 @@ class ViLLayerFusedQKV(nn.Module):
         )
         self.reset_parameters()
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Apply directionality: reverse if specified
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
@@ -552,9 +721,315 @@ class ViLLayerFusedQKV(nn.Module):
 #         self.ffn_norm.reset_parameters()
 #         self.ffn.reset_parameters()
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+@torch.compile
+class DeformableCrossReader(nn.Module):
+    """
+    Deformable cross-attention reader for mLSTM head (grid-sampled, per-level sequence conv, multi-scale).
+    """
+    def __init__(
+        self,
+        *,
+        dim: int,
+        expansion: int = 2,
+        qkv_block_size: int = 32,
+        seqlens_list: list[tuple[int, int]],
+        n_points: int = 4,
+        proj_bias: bool = True,
+        norm_bias: bool = True,
+        conv_bias: bool = True,
+        conv_kernel_size: int = 3,
+        gate_soft_cap: float = 15.0,
+        chunk_size: int = 64,
+        mlstm_kwargs=None,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.expansion = expansion
+        self.qkv_block_size = qkv_block_size
+        self.n_points = n_points
+        self.seqlens_list = [tuple(map(int, s)) for s in seqlens_list]
+        self.n_levels = len(self.seqlens_list)
+        self.inner_dim = expansion * dim
+        self.num_heads = self.inner_dim // qkv_block_size
+
+        # Learn offsets per-query per-level
+        self.offsets = nn.Linear(dim, self.n_levels * self.n_points * 2)
+        # Project context samples (sampled_feats) and query
+        self.sampling_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+        self.query_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+        # QKV projections for sampled context
+        self.context_q_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=proj_bias)
+        self.context_k_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=proj_bias)
+        self.context_v_proj = nn.Linear(self.inner_dim, self.inner_dim, bias=proj_bias)
+
+        # Per-level conv: one SequenceConv2d per scale/grid
+        self.context_convs = nn.ModuleList([
+            SequenceConv2d(
+                self.inner_dim,
+                self.inner_dim,
+                kernel_size=conv_kernel_size,
+                padding=conv_kernel_size // 2,
+                groups=self.inner_dim,
+                bias=conv_bias,
+                seqlens=sl,
+            )
+            for sl in self.seqlens_list
+        ])
+
+
+        # mLSTM cell --------------------------------------------------------------------------
+        self.mlstm_cell = MatrixLSTMCell(
+            dim=self.inner_dim,
+            num_heads=self.num_heads,
+            norm_bias=norm_bias,
+            eps=1e-3,
+            chunk_size=chunk_size,
+            gate_soft_cap=gate_soft_cap,
+        )
+
+        self.proj_down = nn.Linear(self.inner_dim, dim)
+        self.ffn_norm = nn.LayerNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn = FeedForward(
+            embedding_dim=dim,
+            ffn_proj_factor=2.6667,
+            ffn_round_up_to_multiple_of=64,
+            use_bias=proj_bias,
+            weight_mode="fused",
+            num_blocks=1,
+        )
+
+    def forward(self, memory, queries, memory_spatial_shapes, memory_level_start_index=None):
+        """
+        memory: [B, total_mem, dim]
+        queries: [B, Nq, dim]
+        memory_spatial_shapes: [(H1, W1), (H2, W2), ...]
+        memory_level_start_index: [n_levels] (optional)
+        """
+        B, Nq, D = queries.shape
+        n_levels, n_points = self.n_levels, self.n_points
+
+        # Sample offsets
+        reference_points = queries.new_full((B, Nq, n_levels, 2), 0.5)
+        offsets = self.offsets(queries).view(B, Nq, n_levels, n_points, 2)
+        sampling_locations = reference_points.unsqueeze(3) + offsets  # [B, Nq, n_levels, n_points, 2]
+
+        sampled_feats_list = []
+        mem_idx = 0
+        # Sample grids for each level
+        for lvl, (H, W) in enumerate(memory_spatial_shapes):
+            num_tokens = H * W
+            mem = memory[:, mem_idx:mem_idx+num_tokens, :].view(B, H, W, D).permute(0, 3, 1, 2)  # [B, D, H, W]
+            points = sampling_locations[:, :, lvl, :, :]  # [B, Nq, n_points, 2]
+            grid = points.clone()
+            grid[..., 0] = grid[..., 0] * 2 - 1
+            grid[..., 1] = grid[..., 1] * 2 - 1
+            grid = grid.view(B * Nq, n_points, 2).unsqueeze(2)
+            mem_flat = mem.unsqueeze(1).repeat(1, Nq, 1, 1, 1).view(B * Nq, D, H, W)
+            sampled = F.grid_sample(mem_flat, grid, mode='bilinear', align_corners=True)
+            sampled = sampled.squeeze(-1).permute(0, 2, 1)
+            sampled = sampled.view(B, Nq, n_points, D)
+            sampled_feats_list.append(sampled)
+            mem_idx += num_tokens
+
+        # Concatenate per-level samples: [B, Nq, total_points, D]
+        sampled_feats = torch.cat(sampled_feats_list, dim=2)
+        # Project up to inner_dim
+        sampled_feats = self.sampling_proj(sampled_feats)
+
+        # --------- PER-LEVEL SEQUENCE CONVOLUTION -----------
+        conv_feats_list = []
+        start = 0
+        for lvl, conv in enumerate(self.context_convs):
+            pts = n_points
+            lvl_feats = sampled_feats[:, :, start:start+pts, :]
+            B_, Nq_, npts_, C_ = lvl_feats.shape
+            lvl_feats = lvl_feats.view(B_*Nq_, npts_, C_)  # (B*Nq, pts, C)
+            lvl_feats = F.silu(conv(lvl_feats))            # (B*Nq, pts, C)
+            lvl_feats = lvl_feats.view(B, Nq, npts_, C_)
+            conv_feats_list.append(lvl_feats)
+            start += pts
+        context = torch.cat(conv_feats_list, dim=2)        # [B, Nq, total_points, inner_dim]
+
+        # --------- QKV PROJECTIONS -----------
+        context_q = self.context_q_proj(context)
+        context_k = self.context_k_proj(context)
+        context_v = self.context_v_proj(context)
+        query_q = self.query_proj(queries)                 # [B, Nq, inner_dim]
+
+        # --------- FORM SEQUENCE: [context, query] ---------
+        seq_q = torch.cat([context_q, query_q.unsqueeze(2)], dim=2)
+        seq_k = torch.cat([context_k, torch.zeros_like(query_q).unsqueeze(2)], dim=2)
+        seq_v = torch.cat([context_v, torch.zeros_like(query_q).unsqueeze(2)], dim=2)
+        # Reshape for mLSTM: (B*Nq, seq_len, inner_dim)
+        seq_q = seq_q.view(B*Nq, -1, self.inner_dim)
+        seq_k = seq_k.view(B*Nq, -1, self.inner_dim)
+        seq_v = seq_v.view(B*Nq, -1, self.inner_dim)
+
+        # --------- mLSTM ---------
+        out = self.mlstm_cell(seq_q, seq_k, seq_v)   # [B*Nq, seq_len, inner_dim]
+        out = out[:, -1, :]                          # use last position (the query slot)
+        out = self.proj_down(out).view(B, Nq, -1)
+        out = self.ffn_norm(out)
+        out = self.ffn(out)
+        return out
+
+
+
+@torch.compile
+class DeformableCrossReaderNoConv(nn.Module):
+    """
+    Deformable cross-attention reader for mLSTM head, using fused QKV projection.
+    Library-consistent, set-mixer style (no conv over sampled points).
+    """
+    def __init__(
+        self,
+        dim,
+        expansion=2,
+        qkv_block_size=32,
+        n_points=4,
+        seqlens_list=None,  # list of (H, W)
+        proj_bias=True,
+        norm_bias=True,
+        gate_soft_cap=15.0,
+        ffn_proj_factor=2.6667,
+        ffn_round_up_to_multiple_of=64,
+        weight_mode="fused",
+        chunk_size=64,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.expansion = expansion
+        self.qkv_block_size = qkv_block_size
+        self.n_points = n_points
+        self.seqlens_list = seqlens_list
+        self.n_levels = len(seqlens_list) if seqlens_list is not None else 0
+        self.inner_dim = expansion * dim
+        self.num_heads = self.inner_dim // qkv_block_size
+
+        # Deformable offsets per-query
+        self.offsets = nn.Linear(dim, self.n_levels * n_points * 2)
+
+        # Up-project sampled context
+        self.proj_up = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+
+        # Fused QKV projection for context
+        self.context_qkv_proj = nn.Linear(self.inner_dim, 3 * self.inner_dim, bias=proj_bias)
+        # Q projection for query token
+        self.query_proj = nn.Linear(dim, self.inner_dim, bias=proj_bias)
+
+        # mLSTM cell
+        self.mlstm_cell = MatrixLSTMCell(
+            dim=self.inner_dim,
+            num_heads=self.num_heads,
+            norm_bias=norm_bias,
+            eps=1e-5,
+            chunk_size=chunk_size,
+            gate_soft_cap=gate_soft_cap
+        )
+
+        self.learnable_skip = nn.Parameter(torch.ones(self.inner_dim))
+        self.proj_down = nn.Linear(self.inner_dim, dim, bias=proj_bias)
+
+        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn = FeedForward(
+            embedding_dim=dim,
+            ffn_proj_factor=ffn_proj_factor,
+            ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+            use_bias=proj_bias,
+            weight_mode=weight_mode,
+            num_blocks=1,
+        )
+        self.reset_parameters()
+
+    @torch.compile
+    def forward(self, memory, queries, memory_spatial_shapes, memory_level_start_index=None):
+        """
+        memory: [B, total_tokens, dim]
+        queries: [B, Nq, dim]
+        memory_spatial_shapes: [(H1, W1), ...]
+        """
+        residual = queries
+        x = self.norm(queries)
+
+        B, Nq, D = x.shape
+        n_levels, n_points = self.n_levels, self.n_points
+
+        # ---- Deformable Sampling ----
+        reference_points = x.new_full((B, Nq, n_levels, 2), 0.5)
+        offsets = self.offsets(x).view(B, Nq, n_levels, n_points, 2)
+        sampling_locations = reference_points.unsqueeze(3) + offsets  # [B, Nq, n_levels, n_points, 2]
+
+        sampled_feats_list = []
+        mem_idx = 0
+        for lvl, (H, W) in enumerate(memory_spatial_shapes):
+            num_tokens = H * W
+            mem = memory[:, mem_idx:mem_idx+num_tokens, :].view(B, H, W, D).permute(0, 3, 1, 2)  # [B, D, H, W]
+            points = sampling_locations[:, :, lvl, :, :]  # [B, Nq, n_points, 2]
+            grid = points.clone()
+            grid[..., 0] = grid[..., 0] * 2 - 1
+            grid[..., 1] = grid[..., 1] * 2 - 1
+            grid = grid.view(B * Nq, n_points, 2).unsqueeze(2)
+            mem_flat = mem.unsqueeze(1).expand(-1, Nq, -1, -1, -1).reshape(B * Nq, D, H, W)
+            sampled = F.grid_sample(mem_flat, grid, mode='bilinear', align_corners=True)
+            sampled = sampled.squeeze(-1).permute(0, 2, 1)        # [B*Nq, n_points, D]
+            sampled = sampled.view(B, Nq, n_points, D)
+            sampled_feats_list.append(sampled)
+            mem_idx += num_tokens
+
+        # Concatenate all sampled points: [B, Nq, n_levels*n_points, D]
+        sampled_feats = torch.cat(sampled_feats_list, dim=2)
+        x_context = F.silu(self.proj_up(sampled_feats))  # [B, Nq, total_points, inner_dim]
+
+        # --- Fused QKV projection for context ---
+        context_qkv = self.context_qkv_proj(x_context)   # [B, Nq, total_points, 3*inner_dim]
+        context_q, context_k, context_v = torch.chunk(context_qkv, 3, dim=-1)
+
+        # --- Query Q projection ---
+        query_q = self.query_proj(x)                     # [B, Nq, inner_dim]
+
+        # --- mLSTM input sequence: [context, query] ---
+        seq_q = torch.cat([context_q, query_q.unsqueeze(2)], dim=2)
+        seq_k = torch.cat([context_k, torch.zeros_like(query_q).unsqueeze(2)], dim=2)
+        seq_v = torch.cat([context_v, torch.zeros_like(query_q).unsqueeze(2)], dim=2)
+        seq_q = seq_q.view(B*Nq, -1, self.inner_dim)
+        seq_k = seq_k.view(B*Nq, -1, self.inner_dim)
+        seq_v = seq_v.view(B*Nq, -1, self.inner_dim)
+
+        # --- mLSTM ---
+        h_tilde_state = self.mlstm_cell(q=seq_q, k=seq_k, v=seq_v)
+        h_tilde_state = h_tilde_state[:, -1, :]  # take last token (query slot)
+        h_tilde_state_skip = h_tilde_state + (self.learnable_skip * query_q.view(B*Nq, -1))
+        x_mlstm = self.proj_down(h_tilde_state_skip).view(B, Nq, -1)
+
+        # Residual & FFN (ViLLayer style)
+        x = residual + x_mlstm
+        ffn_residual = x
+        x_ffn = self.ffn_norm(x)
+        x_ffn = self.ffn(x_ffn)
+        x = ffn_residual + x_ffn
+
+        return x
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.proj_up.weight)
+        if self.proj_up.bias is not None:
+            nn.init.zeros_(self.proj_up.bias)
+        nn.init.xavier_uniform_(self.context_qkv_proj.weight)
+        if self.context_qkv_proj.bias is not None:
+            nn.init.zeros_(self.context_qkv_proj.bias)
+        nn.init.xavier_uniform_(self.query_proj.weight)
+        if self.query_proj.bias is not None:
+            nn.init.zeros_(self.query_proj.bias)
+        nn.init.xavier_uniform_(self.proj_down.weight)
+        if self.proj_down.bias is not None:
+            nn.init.zeros_(self.proj_down.bias)
+        nn.init.ones_(self.learnable_skip)
+        self.mlstm_cell.reset_parameters()
+        self.norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
+        self.ffn.reset_parameters()
+
 
 
 # =============================================================================
@@ -640,6 +1115,7 @@ class RefactoredxLSTMCrossReader(nn.Module):
         )
         self.reset_parameters()
 
+    @torch.compile
     # ----------------------------------- FORWARD ----------------------------------
     def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
         B, N_mem, D = memory.shape

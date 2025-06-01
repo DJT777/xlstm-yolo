@@ -170,7 +170,7 @@ class MLPBlock(nn.Module):
         """Forward pass for the MLPBlock."""
         return self.lin2(self.act(self.lin1(x)))
 
-
+@torch.compile
 class MLP(nn.Module):
     """Implements a simple multi-layer perceptron (also called FFN)."""
 

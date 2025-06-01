@@ -2506,6 +2506,7 @@ class ViLBlock(nn.Module):
         x_out = einops.rearrange(x_image, "b c h w -> b (h w) c")  # (B, S, hidden_dim)
         return x_out
 
+@torch.compile
 class ViLFusionBlock(nn.Module):
     def __init__(
         self,
@@ -2748,6 +2749,7 @@ class ViLFusionBlock(nn.Module):
 #         return output
 
 # Definition of the PatchMerger class
+@torch.compile
 class PatchMerger(nn.Module):
     def __init__(self, dim, num_tokens_out):
         super().__init__()
