@@ -3747,23 +3747,55 @@ def _build_2d_sincos_embedding(dim: int,
 # -------------------------------------------------------------------------- #
 # generate (memory_direction, query_direction) pairs for decoder layers
 # -------------------------------------------------------------------------- #
-def _reader_traversal_pairs(n_layers: int,
-                            Traversal,
-                            mem_flip_every: int = 1,
-                            qry_flip_every: int = 2):
-    pairs   = []
-    mem_dir = qry_dir = Traversal.ROWWISE_FROM_TOP_LEFT
+# def _reader_traversal_pairs(n_layers: int,
+#                             Traversal,
+#                             mem_flip_every: int = 1,
+#                             qry_flip_every: int = 2):
+#     pairs   = []
+#     mem_dir = qry_dir = Traversal.ROWWISE_FROM_TOP_LEFT
+#     for i in range(n_layers):
+#         if i > 0 and (i % mem_flip_every == 0):
+#             mem_dir = (Traversal.ROWWISE_FROM_BOT_RIGHT
+#                        if mem_dir == Traversal.ROWWISE_FROM_TOP_LEFT
+#                        else Traversal.ROWWISE_FROM_TOP_LEFT)
+#         if i > 0 and (i % qry_flip_every == 0):
+#             qry_dir = (Traversal.ROWWISE_FROM_BOT_RIGHT
+#                        if qry_dir == Traversal.ROWWISE_FROM_TOP_LEFT
+#                        else Traversal.ROWWISE_FROM_TOP_LEFT)
+#         pairs.append((mem_dir, qry_dir))
+#     return pairs
+
+
+def _reader_traversal_pairs(
+    n_layers: int,
+    Traversal,
+    mem_dir1 = None,
+    mem_dir2 = None,
+    qry_dir1 = None,
+    qry_dir2 = None,
+    qry_flip_every: int = 2,
+):
+    """
+    Emphasizes flipping memory direction every layer, query every qry_flip_every layers.
+    Cycles through all 4 (mem, qry) permutations.
+    """
+    mem_dir1 = mem_dir1 or Traversal.ROWWISE_FROM_TOP_LEFT
+    mem_dir2 = mem_dir2 or Traversal.ROWWISE_FROM_BOT_RIGHT
+    qry_dir1 = qry_dir1 or Traversal.ROWWISE_FROM_TOP_LEFT
+    qry_dir2 = qry_dir2 or Traversal.ROWWISE_FROM_BOT_RIGHT
+
+    pairs = []
+    mem_dir = mem_dir1
+    qry_dir = qry_dir1
     for i in range(n_layers):
-        if i > 0 and (i % mem_flip_every == 0):
-            mem_dir = (Traversal.ROWWISE_FROM_BOT_RIGHT
-                       if mem_dir == Traversal.ROWWISE_FROM_TOP_LEFT
-                       else Traversal.ROWWISE_FROM_TOP_LEFT)
-        if i > 0 and (i % qry_flip_every == 0):
-            qry_dir = (Traversal.ROWWISE_FROM_BOT_RIGHT
-                       if qry_dir == Traversal.ROWWISE_FROM_TOP_LEFT
-                       else Traversal.ROWWISE_FROM_TOP_LEFT)
+        if i > 0:
+            mem_dir = mem_dir2 if mem_dir == mem_dir1 else mem_dir1
+            if i % qry_flip_every == 0:
+                qry_dir = qry_dir2 if qry_dir == qry_dir1 else qry_dir1
         pairs.append((mem_dir, qry_dir))
     return pairs
+
+
 
 # -------------------------------------------------------------------------- #
 # Single-Scale Fusion Module
@@ -4061,6 +4093,23 @@ class ViLBasedRTDETRHead(nn.Module):
 
 
 
+def _reader_traversal_pairs(n_layers: int, Traversal):
+    mem_dirs = [
+        Traversal.ROWWISE_FROM_TOP_LEFT,
+        Traversal.ROWWISE_FROM_BOT_RIGHT,
+    ]
+    qry_dirs = [
+        Traversal.ROWWISE_FROM_TOP_LEFT,
+        Traversal.ROWWISE_FROM_BOT_RIGHT,
+    ]
+    pairs = []
+    for i in range(n_layers):
+        mem_dir = mem_dirs[i % len(mem_dirs)]
+        qry_dir = qry_dirs[(i // 2) % len(qry_dirs)]  # flip query every 2 layers for more stability
+        pairs.append((mem_dir, qry_dir))
+    return pairs
+
+
 #TO DO: MULTI SCALE:import torch
 class ViLBasedRTDETRHead(nn.Module):
     """
@@ -4108,7 +4157,7 @@ class ViLBasedRTDETRHead(nn.Module):
                 config=dict(
                     seqlens=fusion_target_size,
                     chunk_size=512,
-                    qkv_block_size=32,
+                    qkv_block_size=vil_block_decoder_args.get("chunk_size", 64),
                     mlp_ratio=4.0,
                     conv_kind="2d",
                 ),
@@ -4128,15 +4177,15 @@ class ViLBasedRTDETRHead(nn.Module):
             self.qkv_block1 = ViLLayerFusedQKV(
                 dim=hidden_dim,
                 expansion=2,
-                qkv_block_size=64,
+                qkv_block_size=vil_block_decoder_args.get("qkv_block_size", 32),
                 proj_bias=True,
                 norm_bias=True,
-                num_blocks=1,
+                num_blocks=num_vil_layers,
                 gate_soft_cap=15.0,
                 ffn_proj_factor=2.6667,
                 ffn_round_up_to_multiple_of=64,
                 weight_mode="fused",
-                chunk_size=512,
+                chunk_size=vil_block_decoder_args.get("chunk_size", 64),
                 direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT,
             )
 
@@ -4147,12 +4196,12 @@ class ViLBasedRTDETRHead(nn.Module):
                 qkv_block_size=64,
                 proj_bias=True,
                 norm_bias=True,
-                num_blocks=1,
+                num_blocks=num_vil_layers,
                 gate_soft_cap=15.0,
                 ffn_proj_factor=2.6667,
                 ffn_round_up_to_multiple_of=64,
                 weight_mode="fused",
-                chunk_size=512,
+                chunk_size=vil_block_decoder_args.get("chunk_size", 64),
                 direction=SequenceTraversal.ROWWISE_FROM_BOT_RIGHT,
             )
 
@@ -4205,7 +4254,7 @@ class ViLBasedRTDETRHead(nn.Module):
         self.decoder_norm = nn.LayerNorm(hidden_dim, eps=1e-6, elementwise_affine=True)
 
         # Decoder writer/reader (unchanged)
-        base_cfg = dict(dim=hidden_dim, expansion=2, qkv_block_size=max(1, hidden_dim // 64))
+        base_cfg = dict(dim=hidden_dim, expansion=2, qkv_block_size=vil_block_decoder_args.get("qkv_block_size"))
         if vil_block_decoder_args:
             base_cfg.update(vil_block_decoder_args)
         self.writer = nn.ModuleList(
@@ -4221,10 +4270,9 @@ class ViLBasedRTDETRHead(nn.Module):
         )
         dir_pairs = _reader_traversal_pairs(
             num_vil_layers,
-            SequenceTraversal,
-            mem_flip_every=1,
-            qry_flip_every=2
+            SequenceTraversal
         )
+        
         if deformable == True:
             self.reader = nn.ModuleList(
                         DeformableCrossReader(
@@ -4364,6 +4412,7 @@ class ViLBasedRTDETRHead(nn.Module):
 
         return q_content, q_boxes, enc_boxes, enc_scores, dn_meta
 
+    @torch.compile
     def forward(self, feats_per_level, batch=None):
         B = feats_per_level[0].size(0)
 
