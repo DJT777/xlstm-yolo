@@ -2928,3 +2928,89 @@ def wang_init_(param: torch.Tensor, dim: int, num_blocks: int):
     std = 2 / num_blocks / math.sqrt(dim)
     torch.nn.init.normal_(param, mean=0.0, std=std)
     return param
+
+
+
+class ViLLayerFusedQKV(nn.Module):
+    def __init__(self, dim, expansion=2, qkv_block_size=4, proj_bias=True, norm_bias=True,
+                 num_blocks=1, gate_soft_cap=15.0, ffn_proj_factor=2.6667, ffn_round_up_to_multiple_of=64,
+                 weight_mode="fused", chunk_size=64, direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT):
+        super().__init__()
+        assert dim % qkv_block_size == 0, "dim must be divisible by qkv_block_size"
+        self.dim = dim
+        self.expansion = expansion
+        self.qkv_block_size = qkv_block_size
+        self.gate_soft_cap = gate_soft_cap
+        self.weight_mode = weight_mode
+        self.num_blocks = num_blocks
+        self.direction = direction
+
+        inner_dim = expansion * dim
+        num_heads = inner_dim // qkv_block_size
+        self.inner_dim = inner_dim
+        self.num_heads = num_heads
+
+        self.q_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+        self.k_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+        self.v_proj = nn.Linear(dim, inner_dim, bias=proj_bias)
+
+        self.mlstm_cell = MatrixLSTMCell(
+            dim=inner_dim, num_heads=num_heads, norm_bias=norm_bias,
+            eps=1e-5, chunk_size=chunk_size, gate_soft_cap=gate_soft_cap
+        )
+
+        self.proj_down = nn.Linear(inner_dim, dim, bias=proj_bias)
+        self.norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn_norm = nn.RMSNorm(dim, eps=1e-6, elementwise_affine=norm_bias)
+        self.ffn = FeedForward(
+            embedding_dim=dim,
+            ffn_proj_factor=ffn_proj_factor,
+            ffn_round_up_to_multiple_of=ffn_round_up_to_multiple_of,
+            use_bias=proj_bias,
+            weight_mode=weight_mode,
+            num_blocks=num_blocks or 1,
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.xavier_uniform_(self.q_proj.weight); nn.init.zeros_(self.q_proj.bias)
+        nn.init.xavier_uniform_(self.k_proj.weight); nn.init.zeros_(self.k_proj.bias)
+        nn.init.xavier_uniform_(self.v_proj.weight); nn.init.zeros_(self.v_proj.bias)
+        nn.init.xavier_uniform_(self.proj_down.weight); nn.init.zeros_(self.proj_down.bias)
+        self.mlstm_cell.reset_parameters()
+        self.norm.reset_parameters()
+        self.ffn_norm.reset_parameters()
+        self.ffn.reset_parameters()
+
+    def compress(self, x):
+        # Only K and V get projected; Q is zeroed out.
+        x_norm = self.norm(x)
+        k = self.k_proj(x_norm)
+        v = self.v_proj(x_norm)
+        q = torch.zeros_like(k)
+        _, (c_mem, n_mem, m_mem) = self.mlstm_cell(q=q, k=k, v=v, return_last_states=True)
+        return (c_mem, n_mem, m_mem)
+
+    def query(self, queries, memory_state):
+        # Only Q gets projected; K and V are zeroed out.
+        q = self.q_proj(self.norm(queries))
+        k = torch.zeros_like(q)
+        v = torch.zeros_like(q)
+        h = self.mlstm_cell(q=q, k=k, v=v, initial_states=memory_state)
+        h_proj = self.proj_down(h)
+        out = h_proj + self.ffn(self.ffn_norm(h_proj))
+        return out
+
+    def forward(self, x, mode="compress", queries=None, memory_state=None):
+        """
+        mode: "compress" or "query"
+        For "compress", x = FPN seq, returns memory state tuple.
+        For "query", queries=your query tensor, memory_state=previous memory state.
+        """
+        if mode == "compress":
+            return self.compress(x)
+        elif mode == "query":
+            assert queries is not None and memory_state is not None
+            return self.query(queries, memory_state)
+        else:
+            raise ValueError("Unknown mode: %s" % mode)

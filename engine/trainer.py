@@ -963,9 +963,9 @@ class BaseTrainer:
 
         # Build param groups for optimizer
         param_groups = [
-            {"params": groups[0], "lr": lr * 0.1, "weight_decay": decay},    # body weights
-            {"params": groups[1], "lr": lr * 0.1, "weight_decay": 0.0},      # body norms
-            {"params": groups[2], "lr": lr * 0.1, "weight_decay": 0.0},      # body bias
+            {"params": groups[0], "lr": lr * 0.25, "weight_decay": decay},    # body weights
+            {"params": groups[1], "lr": lr * 0.25, "weight_decay": 0.0},      # body norms
+            {"params": groups[2], "lr": lr * 0.25, "weight_decay": 0.0},      # body bias
             {"params": groups[3], "lr": lr,       "weight_decay": decay},    # head weights
             {"params": groups[4], "lr": lr,       "weight_decay": 0.0},      # head norms
             {"params": groups[5], "lr": lr,       "weight_decay": 0.0},      # head bias
