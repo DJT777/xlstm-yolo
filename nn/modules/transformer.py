@@ -170,6 +170,25 @@ class MLPBlock(nn.Module):
         """Forward pass for the MLPBlock."""
         return self.lin2(self.act(self.lin1(x)))
 
+class PyramidMLP(nn.Module):
+    """
+    Builds a sequential MLP whose layer widths follow `dims`.
+    E.g. dims = [4,  96, 192, 384] produces:
+      Linear(4→96) → SiLU → Linear(96→192) → SiLU → Linear(192→384)
+    """
+    def __init__(self, dims: list[int], activation: type[nn.Module] = nn.SiLU):
+        super().__init__()
+        layers: list[nn.Module] = []
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:
+                layers.append(activation(inplace=True))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.net(x)
+
+
 @torch.compile
 class MLP(nn.Module):
     """Implements a simple multi-layer perceptron (also called FFN)."""
@@ -188,6 +207,7 @@ class MLP(nn.Module):
         for i, layer in enumerate(self.layers):
             x = getattr(self, "act", nn.ReLU())(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x.sigmoid() if getattr(self, "sigmoid", False) else x
+
 
 
 class LayerNorm2d(nn.Module):

@@ -31,7 +31,7 @@ class DETRLoss(nn.Module):
     """
 
     def __init__(
-        self, nc=80, loss_gain=None, aux_loss=True, use_fl=False, use_vfl=True, use_uni_match=False, uni_match_ind=0
+        self, nc=80, loss_gain=None, aux_loss=True, use_fl=True, use_vfl=True, use_uni_match=False, uni_match_ind=0
     ):
         """
         Initialize DETR loss function with customizable components and gains.
@@ -51,7 +51,7 @@ class DETRLoss(nn.Module):
         super().__init__()
 
         if loss_gain is None:
-            loss_gain = {"class": 0.4, "bbox": 5, "giou": 2, "no_object": 0.1, "mask": 1, "dice": 1}
+            loss_gain = {"class": 1.0, "bbox": 5, "giou": 2, "no_object": 0.1, "mask": 1, "dice": 1}
         self.nc = nc
         self.matcher = HungarianMatcher(cost_gain={"class": 2, "bbox": 5, "giou": 2})
         self.loss_gain = loss_gain

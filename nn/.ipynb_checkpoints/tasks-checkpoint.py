@@ -648,7 +648,7 @@ class RTDETRDetectionModel(DetectionModel):
         """Initialize the loss criterion for the RTDETRDetectionModel."""
         from ultralytics.models.utils.loss import RTDETRDetectionLoss
 
-        return RTDETRDetectionLoss(nc=self.nc, use_vfl=True)
+        return RTDETRDetectionLoss(nc=self.nc, use_vfl=False, use_fl=False)
 
     def loss(self, batch, preds=None):
         """

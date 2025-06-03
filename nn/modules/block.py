@@ -2763,6 +2763,96 @@ class PatchMerger(nn.Module):
         attn = sim.softmax(dim=-1)
         return torch.matmul(attn, x)
 
+from .vision_lstm.vision_lstm2 import ViLLayerFusedQKV, ViLLayer
+from .vision_lstm.vision_lstm import SequenceTraversal
+
+
+class TwoLayerFusedQKV(nn.Module):
+    """
+    A fused-QKV encoder that always applies two ViLLayerFusedQKV layers
+    in alternating directions, then returns a (B, hidden_dim, H, W) tensor.
+
+    Step-by-step:
+      1) Optionally project concatenated channels → hidden_dim via 1×1 conv.
+      2) Flatten (B, hidden_dim, H, W) → (B, H*W, hidden_dim).
+      3) Apply layer 0 with ROWWISE_FROM_TOP_LEFT, then layer 1 with ROWWISE_FROM_BOT_RIGHT.
+      4) Reshape back → (B, hidden_dim, H, W).
+    """
+    def __init__(
+        self,
+        in_channels: int,
+        hidden_dim: int,
+        qkv_block_size: int = 64,
+        expansion: float = 2.0,
+        proj_bias: bool = True,
+        norm_bias: bool = True,
+        chunk_size: int = 512,
+        gate_soft_cap: float = 15.0,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+
+        # 1) If in_channels != hidden_dim, do a 1×1 conv → hidden_dim
+        self.in_proj = (
+            nn.Sequential(
+                nn.Conv2d(in_channels, hidden_dim, kernel_size=1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.SiLU()
+            ) if in_channels != hidden_dim else nn.Identity()
+        )
+
+        # 2) Layer 0: top-left → bottom-right direction
+        self.layer0 = ViLLayer(
+            dim=hidden_dim,
+            expansion=expansion,
+            qkv_block_size=qkv_block_size,
+            proj_bias=proj_bias,
+            norm_bias=norm_bias,
+            num_blocks=1,
+            gate_soft_cap=gate_soft_cap,
+            ffn_proj_factor=2.6667,
+            ffn_round_up_to_multiple_of=64,
+            weight_mode="fused",
+            chunk_size=chunk_size,
+            direction=SequenceTraversal.ROWWISE_FROM_TOP_LEFT,
+        )
+
+        # 3) Layer 1: bottom-right → top-left direction
+        self.layer1 = ViLLayer(
+            dim=hidden_dim,
+            expansion=expansion,
+            qkv_block_size=qkv_block_size,
+            proj_bias=proj_bias,
+            norm_bias=norm_bias,
+            num_blocks=1,
+            gate_soft_cap=gate_soft_cap,
+            ffn_proj_factor=2.6667,
+            ffn_round_up_to_multiple_of=64,
+            weight_mode="fused",
+            chunk_size=chunk_size,
+            direction=SequenceTraversal.ROWWISE_FROM_BOT_RIGHT,
+        )
+
+    @torch.compile
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C_total, H, W)
+        Returns: (B, hidden_dim, H, W)
+        """
+        # 1) Project channels if needed
+        x = self.in_proj(x)             # (B, hidden_dim, H, W)
+        B, C, H, W = x.shape
+
+        # 2) Flatten → (B, H*W, hidden_dim)
+        seq = einops.rearrange(x, "b c h w -> b (h w) c")
+
+        # 3) Apply layer0 (top-left) then layer1 (bot-right)
+        seq = self.layer0(seq)  # still (B, H*W, hidden_dim)
+        seq = self.layer1(seq)  # still (B, H*W, hidden_dim)
+
+        # 4) Reshape back to (B, hidden_dim, H, W)
+        out = einops.rearrange(seq, "b (h w) c -> b c h w", h=H, w=W)
+        return out
 
 nn.ViLLayerNormBlock = ViLLayerNormBlock
 nn.ViLInternalNorm = LayerNorm 
