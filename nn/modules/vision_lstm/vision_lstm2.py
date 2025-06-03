@@ -182,6 +182,7 @@ class FeedForward(nn.Module):
 
         self.act_fn = nn.SiLU()
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.weight_mode == "single":
             x = self.act_fn(self.proj_up_gate(x)) * self.proj_up(x)
@@ -215,7 +216,6 @@ class FeedForward(nn.Module):
             nn.init.zeros_(self.proj_down.bias)
 
 #grok refactor no gated Z
-@torch.compile
 class ViLLayer(nn.Module):
     def __init__(self,
                  dim,
@@ -298,6 +298,7 @@ class ViLLayer(nn.Module):
 
         self.reset_parameters()
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.norm(x)
@@ -368,8 +369,7 @@ class ViLLayer(nn.Module):
         self.ffn_norm.reset_parameters()
         self.ffn.reset_parameters()
 
-# ViLLayer with directionality
-@torch.compile
+
 class ViLLayerFusedQKV(nn.Module):
     def __init__(self,
                  dim,
@@ -425,6 +425,7 @@ class ViLLayerFusedQKV(nn.Module):
         )
         self.reset_parameters()
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Apply directionality: reverse if specified
         if self.direction == SequenceTraversal.ROWWISE_FROM_BOT_RIGHT:
@@ -560,7 +561,7 @@ import torch.nn.functional as F
 # =============================================================================
 #                        MULTI‑SCALE CROSS‑READER
 # =============================================================================
-@torch.compile
+
 class RefactoredxLSTMCrossReader(nn.Module):
     """Same xLSTM reader, *now* able to ingest a **concatenated** multi‑scale
     memory and internally apply an independent depth‑wise convolution to each
@@ -640,6 +641,8 @@ class RefactoredxLSTMCrossReader(nn.Module):
         )
         self.reset_parameters()
 
+
+    @torch.compile
     # ----------------------------------- FORWARD ----------------------------------
     def forward(self, memory: torch.Tensor, queries: torch.Tensor) -> torch.Tensor:
         B, N_mem, D = memory.shape
@@ -1123,6 +1126,7 @@ class MatrixLSTMCell(nn.Module):
 
         self.reset_parameters()
 
+    @torch.compile
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
         B, S, H = q.shape  # (B, S, H)
         dtype = q.dtype

@@ -4001,6 +4001,7 @@ class ViLBasedRTDETRHead(nn.Module):
             enc_scores, enc_boxes = sel_score, sel_box.sigmoid()
         return q_content, q_boxes, enc_boxes, enc_scores, dn_meta
 
+    @torch.compile
     def forward(self, feats_per_level, batch=None):
         B = feats_per_level[0].size(0)
         if self.use_single_scale:
