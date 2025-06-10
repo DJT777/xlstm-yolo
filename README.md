@@ -1,0 +1,1 @@
+Code is made on a public repository to adhere to Ultralytics requirements for open-sourcing. This repository is currently a work in progress to release an open-source research into xLSTM as a vision backbone.
